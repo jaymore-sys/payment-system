@@ -2,7 +2,7 @@
 --   mysql testdb < schema.sql && mysql testdb < test_schema.sql
 -- Each `DO IF(ok, 0, (SELECT 1 UNION SELECT 2))` errors ("more than 1 row") when a check fails.
 
-INSERT INTO users (name, email, password_hash, role) VALUES ('Admin','a@x','-','admin'), ('Staff','s@x','-','staff');
+INSERT INTO users (name, email, password_hash, role) VALUES ('Admin','a@x','-','admin'), ('Maker','s@x','-','administrator');
 INSERT INTO parties (name, gst_registered) VALUES ('Acme', TRUE);
 
 INSERT INTO cash_entries (entry_date, amount, kind, created_by) VALUES (CURDATE(), 100000, 'opening', 1);

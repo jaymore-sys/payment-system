@@ -41,6 +41,12 @@ function db(): PDO
         $sql = preg_replace('/--.*$/m', '', file_get_contents(__DIR__ . '/schema.sql'));
         foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt) $db->exec($stmt);
     }
+    // ponytail: inline migration from the first release's admin/staff roles; move to versioned migrations if more pile up
+    if (str_contains($db->query("SHOW COLUMNS FROM users LIKE 'role'")->fetch()['Type'], "'staff'")) {
+        $db->exec("ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer','staff') NOT NULL DEFAULT 'administrator'");
+        $db->exec("UPDATE users SET role = 'administrator' WHERE role = 'staff'");
+        $db->exec("ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator'");
+    }
     return $db;
 }
 
@@ -63,8 +69,23 @@ function me(): ?array
     if ($u === false) $u = isset($_SESSION['uid']) ? (q('SELECT * FROM users WHERE id = ?', [$_SESSION['uid']])->fetch() ?: null) : null;
     return $u;
 }
-function is_admin(): bool { return (me()['role'] ?? '') === 'admin'; }
-function need_admin(): void { if (!is_admin()) fail('Only admin can do this.', 403); }
+const ROLES = ['administrator' => 'Administrator: makes requests', 'admin' => 'Admin: approves', 'superadmin' => 'Super admin: views everything',
+               'developer' => 'Developer: manages logins'];
+// who may do what; every permission check in the app goes through can()/need()
+const PERMS = [
+    'view'       => ['superadmin', 'admin', 'administrator'], // payments, receipts, statement, files
+    'request'    => ['administrator'],                        // create/edit payments & receipts, due dates
+    'approve'    => ['admin'],
+    'pay'        => ['admin', 'administrator'],
+    'files'      => ['admin', 'administrator'],
+    'chat'       => ['superadmin', 'admin', 'administrator'],
+    'manage'     => ['admin'],                                // balance entries, undo paid, deletes
+    'see_cash'   => ['superadmin', 'admin'],
+    'users'      => ['developer'],
+    'see_users'  => ['superadmin', 'developer'],
+];
+function can(string $perm): bool { return in_array(me()['role'] ?? '', PERMS[$perm], true); }
+function need(string $perm): void { if (!can($perm)) fail('Your role does not allow this.', 403); }
 function login(int|string $id): void
 {
     session_regenerate_id(true);
@@ -184,10 +205,13 @@ td form{margin:0}
 <body><header class="container"><nav>
 <ul><li><strong>💰 Payments</strong></li></ul>
 <?php if ($u): ?><ul>
+<?php if (can('view')): ?>
 <li><a href="?">Dashboard</a></li><li><a href="?p=payments">Payments</a></li><li><a href="?p=receivables">Receivables</a></li>
 <li><a href="?p=statement">Statement</a></li><li><a href="?p=chat">Chat</a></li>
-<?php if ($u['role'] === 'admin'): ?><li><a href="?p=cash">Balance entries</a></li><li><a href="?p=users">Users</a></li><?php endif ?>
-<li><a href="?p=logout">Logout (<?= h($u['name']) ?>)</a></li>
+<?php endif ?>
+<?php if (can('see_cash')): ?><li><a href="?p=cash">Balance entries</a></li><?php endif ?>
+<?php if (can('see_users')): ?><li><a href="?p=users">Users</a></li><?php endif ?>
+<li><a href="?p=logout">Logout (<?= h($u['name']) ?> · <?= h($u['role']) ?>)</a></li>
 </ul><?php endif ?>
 </nav></header>
 <main class="container">

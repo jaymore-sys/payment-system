@@ -6,10 +6,10 @@
 --   + receivables  − payments with status 'paid'
 -- so it cannot drift from the records.
 --
--- Rules the app enforces (MySQL has no per-user row security):
---   only admin approves/rejects; a payment must be 'approved' before 'paid';
---   only admin edits or deletes a paid payment, receivables and cash_entries;
---   the first registered user becomes admin.
+-- Roles (enforced by the app, see can() in app.php):
+--   administrator makes requests, admin approves, superadmin views everything,
+--   developer manages logins. The first registered user becomes developer.
+--   A payment must be 'approved' before 'paid'.
 
 SET NAMES utf8mb4;
 
@@ -18,7 +18,7 @@ CREATE TABLE users (
   name          VARCHAR(100) NOT NULL,
   email         VARCHAR(190) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,           -- PHP password_hash()
-  role          ENUM('admin','staff') NOT NULL DEFAULT 'staff',
+  role          ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator',
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
