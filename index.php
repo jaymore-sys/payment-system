@@ -64,66 +64,94 @@ case 'logout':
     session_destroy();
     go('?p=login');
 
-// ── dashboard ─────────────────────────────────────────────────────────────
+// ── dashboard: admin sees alerts + approvals, everyone else the money overview ─
 case 'home':
-    $bal  = q('SELECT balance FROM current_balance')->fetchColumn();
     $dues = q('SELECT * FROM upcoming_dues ORDER BY due_date')->fetchAll();
-    $mon  = q("SELECT (SELECT COALESCE(SUM(amount), 0) FROM receivables WHERE status = 'approved' AND received_on >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS received,
-                      (SELECT COALESCE(SUM(amount), 0) FROM payouts WHERE in_balance AND paid_on >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS paid")->fetch();
     [$t] = summarize(q('SELECT * FROM payment_register')->fetchAll());
     $mine = pending_for_me();
-    $my_open = can('request') ? (int) q("SELECT COUNT(*) FROM requests WHERE created_by = ? AND status = 'pending'", [me()['id']])->fetchColumn() : 0;
     $popup = ($dues || $mine) && empty($_SESSION['dues_seen']);
     if ($popup) $_SESSION['dues_seen'] = true;
-    $acts = can('request') ? '<a href="?p=payment" role="button">＋ New invoice</a><a href="?p=receivables#add" role="button" class="secondary">＋ Receipt</a>' : '';
-    head('Dashboard', $acts); ?>
-    <div class="stats">
-      <article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article>
-      <article class="stat" data-icon="📌"><small>Total outstanding</small><div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div></article>
-      <article class="stat red" data-icon="⏰"><small>Overdue outstanding</small><div class="big neg"><a href="?p=payments&age=overdue"><?= money($t['overdue']) ?></a></div></article>
-      <?php if (can('approve')): ?>
-        <article class="stat green" data-icon="✅"><small>Waiting for your approval</small><div class="big"><a href="?p=approvals"><?= $mine ?></a></div></article>
-      <?php else: ?>
-        <article class="stat green" data-icon="📨"><small><?= can('request') ? 'My pending requests' : 'Pending approvals' ?></small>
-          <div class="big"><a href="?p=approvals"><?= can('request') ? $my_open : (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending'")->fetchColumn() ?></a></div></article>
-      <?php endif ?>
-    </div>
-    <div class="two">
-      <article><header><strong>🧾 Payables</strong></header><table class="kv">
-        <tr><td>Total invoiced</td><td class="right"><?= money($t['invoiced']) ?></td></tr>
-        <tr><td>Total paid</td><td class="right pos"><?= money($t['paid']) ?></td></tr>
-        <tr><td>Total outstanding</td><td class="right"><strong><?= money($t['outstanding']) ?></strong></td></tr>
-        <tr><td>Invoices with balance</td><td class="right"><?= $t['with_balance'] ?></td></tr>
-        <tr><td>Fully paid invoices</td><td class="right"><?= $t['fully_paid'] ?></td></tr>
-        <tr><td>Paid this month</td><td class="right neg"><?= money($mon['paid']) ?></td></tr>
-        <tr><td>Received this month</td><td class="right pos"><?= money($mon['received']) ?></td></tr>
-      </table></article>
-      <article><header><strong>⏳ Outstanding ageing</strong></header><table class="kv">
+    $due_table = function (int $limit = 10, bool $approval = true) use ($dues, $date) { ?>
+      <div class="tbl stack"><table><thead><tr><th>Party</th><th>Invoice</th><th class="right">Outstanding</th><th>Due</th><?= $approval ? '<th>Approval</th>' : '' ?></tr></thead><tbody>
+      <?php foreach (array_slice($dues, 0, $limit) as $d): ?>
+        <tr><td class="clip"><a href="?p=payment&id=<?= $d['id'] ?>" title="<?= h($d['party']) ?>"><?= h($d['party']) ?></a></td><td><?= h($d['invoice_no'] ?: $d['products']) ?></td>
+          <td class="right"><strong><?= money($d['outstanding']) ?></strong></td>
+          <td><?= $date($d['due_date']) ?><div class="sub <?= $d['days_left'] < 0 ? 'neg' : '' ?>">
+            <?= $d['days_left'] < 0 ? abs($d['days_left']) . ' days overdue' : ($d['days_left'] == 0 ? 'due today' : "due in {$d['days_left']} days") ?></div></td>
+          <?= $approval ? '<td>' . badge($d['status']) . '</td>' : '' ?></tr>
+      <?php endforeach ?></tbody></table></div>
+      <?php if (count($dues) > $limit): ?><p><a href="?p=payments&age=overdue">View all <?= count($dues) ?> overdue / due-soon invoices →</a></p><?php endif ?>
+    <?php };
+    $ageing = function (bool $header = true) use ($t) { ?>
+      <article class="<?= $header ? '' : 'flush' ?>"><?= $header ? '<header>⏳ Outstanding ageing</header>' : '' ?><table class="kv">
         <?php $colors = ['not_due' => '#10b981', 'd1_30' => '#f59e0b', 'd31_60' => '#f97316', 'd61_90' => '#ef4444', 'd90' => '#b91c1c'];
         foreach (AGEING as $k => $label): $pct = $t['outstanding'] > 0 ? round($t[$k] / $t['outstanding'] * 100) : 0; ?>
           <tr><td><a href="?p=payments&age=<?= $k ?>"><?= h($label) ?></a><div class="bar" style="--c:<?= $colors[$k] ?>"><i style="width:<?= $pct ?>%"></i></div></td>
             <td class="right"><?= money($t[$k]) ?><br><small><?= $pct ?>%</small></td></tr>
         <?php endforeach ?>
       </table></article>
-    </div>
-    <h3>⏰ Due within 7 days / overdue</h3>
-    <?php $due_table = function () use ($dues, $date) { ?>
-      <div class="tbl"><table><thead><tr><th>Party</th><th>Invoice</th><th class="right">Outstanding</th><th>Due</th><th>Approval</th></tr></thead><tbody>
-      <?php foreach (array_slice($dues, 0, 10) as $d): ?>
-        <tr><td><a href="?p=payment&id=<?= $d['id'] ?>"><?= h($d['party']) ?></a></td><td><?= h($d['invoice_no'] ?: $d['products']) ?></td>
-          <td class="right"><strong><?= money($d['outstanding']) ?></strong></td>
-          <td class="<?= $d['days_left'] < 0 ? 'neg' : '' ?>"><?= $date($d['due_date']) ?>
-            (<?= $d['days_left'] < 0 ? abs($d['days_left']) . ' days overdue' : ($d['days_left'] == 0 ? 'today' : "in {$d['days_left']} days") ?>)</td>
-          <td><?= badge($d['status']) ?></td></tr>
-      <?php endforeach ?></tbody></table></div>
-      <?php if (count($dues) > 10): ?><p><a href="?p=payments&age=overdue">View all <?= count($dues) ?> overdue / due-soon invoices →</a></p><?php endif ?>
     <?php };
-    $dues ? $due_table() : print('<div class="panel empty">Nothing due in the next 7 days. 🎉</div>');
+
+    if (can('approve')):
+        $pending = requests_for_me();
+        $pend_amt = array_sum(array_map(fn($r) => paise($r['amount']), $pending)) / 100;
+        $overdue = array_filter($dues, fn($d) => $d['days_left'] < 0);
+        $soon = array_filter($dues, fn($d) => $d['days_left'] >= 0);
+        $sum = fn($rows) => array_sum(array_map(fn($d) => paise($d['outstanding']), $rows)) / 100;
+        head('Dashboard'); ?>
+        <div class="stats">
+          <article class="stat green" data-icon="✅"><small>Waiting for your approval</small>
+            <div class="big"><a href="?p=approvals"><?= count($pending) ?></a></div><div class="sub"><?= money($pend_amt) ?></div></article>
+          <article class="stat red" data-icon="⏰"><small>Overdue invoices</small>
+            <div class="big neg"><a href="?p=payments&age=overdue"><?= count($overdue) ?></a></div><div class="sub neg"><?= money($sum($overdue)) ?> outstanding</div></article>
+          <article class="stat" data-icon="📅"><small>Due in next 7 days</small>
+            <div class="big"><?= count($soon) ?></div><div class="sub"><?= money($sum($soon)) ?> outstanding</div></article>
+          <article class="stat" data-icon="📌"><small>Total outstanding</small>
+            <div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div><div class="sub"><?= $t['with_balance'] ?> invoices</div></article>
+        </div>
+        <h3>✅ Waiting for your approval</h3>
+        <?php if ($pending): requests_table(array_slice($pending, 0, 10), $date);
+            if (count($pending) > 10): ?><p><a href="?p=approvals">Open all <?= count($pending) ?> requests →</a></p><?php endif;
+        else: ?><div class="panel empty">All caught up — no requests waiting for you. 🎉</div><?php endif ?>
+        <div class="two split">
+          <div><h3>⏰ Overdue &amp; due in 7 days</h3><?php $dues ? $due_table(8, false) : print('<div class="panel empty">Nothing due. 🎉</div>') ?></div>
+          <div><h3>⏳ Outstanding ageing</h3><?php $ageing(false) ?></div>
+        </div>
+    <?php else:
+        $bal = q('SELECT balance FROM current_balance')->fetchColumn();
+        $mon = q("SELECT (SELECT COALESCE(SUM(amount), 0) FROM receivables WHERE status = 'approved' AND received_on >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS received,
+                         (SELECT COALESCE(SUM(amount), 0) FROM payouts WHERE in_balance AND paid_on >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS paid")->fetch();
+        $open_req = can('request') ? (int) q("SELECT COUNT(*) FROM requests WHERE created_by = ? AND status = 'pending'", [me()['id']])->fetchColumn()
+                                   : (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending'")->fetchColumn();
+        $acts = can('request') ? '<a href="?p=payment" role="button">＋ New invoice</a><a href="?p=receivables#add" role="button" class="secondary">＋ Receipt</a>' : '';
+        head('Dashboard', $acts); ?>
+        <div class="stats">
+          <article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article>
+          <article class="stat" data-icon="📌"><small>Total outstanding</small><div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div></article>
+          <article class="stat red" data-icon="⏰"><small>Overdue outstanding</small><div class="big neg"><a href="?p=payments&age=overdue"><?= money($t['overdue']) ?></a></div></article>
+          <article class="stat green" data-icon="📨"><small><?= can('request') ? 'My pending requests' : 'Pending approvals' ?></small>
+            <div class="big"><a href="?p=approvals"><?= $open_req ?></a></div></article>
+        </div>
+        <div class="two">
+          <article><header>🧾 Payables</header><table class="kv">
+            <tr><td>Total invoiced</td><td class="right"><?= money($t['invoiced']) ?></td></tr>
+            <tr><td>Total paid</td><td class="right pos"><?= money($t['paid']) ?></td></tr>
+            <tr><td>Total outstanding</td><td class="right"><strong><?= money($t['outstanding']) ?></strong></td></tr>
+            <tr><td>Invoices with balance</td><td class="right"><?= $t['with_balance'] ?></td></tr>
+            <tr><td>Fully paid invoices</td><td class="right"><?= $t['fully_paid'] ?></td></tr>
+            <tr><td>Paid this month</td><td class="right neg"><?= money($mon['paid']) ?></td></tr>
+            <tr><td>Received this month</td><td class="right pos"><?= money($mon['received']) ?></td></tr>
+          </table></article>
+          <?php $ageing() ?>
+        </div>
+        <h3>⏰ Due within 7 days / overdue</h3>
+        <?php $dues ? $due_table() : print('<div class="panel empty">Nothing due in the next 7 days. 🎉</div>');
+    endif;
     if ($popup): ?>
       <dialog open><article>
-        <header><strong>🔔 Reminders</strong></header>
+        <header>🔔 Reminders</header>
         <?php if ($mine): ?><p class="note">📨 <strong><?= $mine ?></strong> request<?= $mine > 1 ? 's are' : ' is' ?> waiting for your approval. <a href="?p=approvals">Open approvals →</a></p><?php endif ?>
-        <?php if ($dues): ?><p><strong>Payments due within 7 days or overdue:</strong></p><?php $due_table(); endif ?>
+        <?php if ($dues): ?><p><strong>Payments due within 7 days or overdue:</strong></p><?php $due_table(5); endif ?>
         <footer><button onclick="this.closest('dialog').close()">OK</button></footer>
       </article></dialog>
     <?php endif;
@@ -135,33 +163,22 @@ case 'approvals':
         $type = enum_in($_POST['type'] ?? '', array_keys(REVIEWABLE));
         $id = (int) ($_POST['id'] ?? 0);
         review($type, $id, $a === 'approve', trim($_POST['reason'] ?? ''));
-        $from_invoice = $type === 'invoice' && str_contains($_SERVER['HTTP_REFERER'] ?? '', 'p=payment&');
-        go($from_invoice ? "?p=payment&id=$id" : '?p=approvals', $a === 'approve' ? 'Approved' : 'Rejected');
+        $ref = $_SERVER['HTTP_REFERER'] ?? '';
+        $back = $type === 'invoice' && str_contains($ref, 'p=payment&') ? "?p=payment&id=$id" : (str_contains($ref, 'p=approvals') ? '?p=approvals' : '?');
+        go($back, $a === 'approve' ? 'Approved' : 'Rejected');
     }
-    $base = 'SELECT r.*, u.name AS by_name, v.name AS approver FROM requests r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.approver_id';
-    $link = fn($r) => $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables';
     if (can('approve')) {
-        $rows = q("$base WHERE r.status = 'pending' AND (r.approver_id = ? OR r.approver_id IS NULL) ORDER BY r.created_at", [me()['id']])->fetchAll();
+        $rows = requests_for_me();
         $title = 'Waiting for your approval';
     } elseif (can('request')) {
-        $rows = q("$base WHERE r.created_by = ? AND r.approver_id IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
+        $rows = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approver_id IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
         $title = 'My requests';
     } else {
-        $rows = q("$base WHERE r.status = 'pending' ORDER BY r.created_at")->fetchAll();
+        $rows = q(REQUESTS_SQL . " WHERE r.status = 'pending' ORDER BY r.created_at")->fetchAll();
         $title = 'Pending approvals';
     }
     head($title);
-    if (!$rows): ?><div class="panel empty">Nothing here right now. 🎉</div><?php else: ?>
-    <div class="tbl"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><th></th></tr></thead><tbody>
-    <?php foreach ($rows as $r): ?>
-      <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
-        <td class="wrap"><a href="<?= $link($r) ?>"><?= h($r['detail']) ?></a><?= $r['status'] === 'rejected' ? '<br><small class="neg">Reason: ' . h($r['reject_reason']) . '</small>' : '' ?></td>
-        <td class="right <?= $r['amount'] < 0 ? 'neg' : '' ?>"><strong><?= money($r['amount']) ?></strong></td>
-        <td><?= h($r['by_name']) ?><br><small><?= $date($r['created_at']) ?></small></td><td><?= h($r['approver'] ?? 'any admin') ?></td>
-        <td><?= badge($r['status']) ?></td>
-        <td><?= can('approve') ? review_buttons($r['type'], (int) $r['id'], $r['status']) : '' ?></td></tr>
-    <?php endforeach ?></tbody></table></div>
-    <?php endif;
+    $rows ? requests_table($rows, $date) : print('<div class="panel empty">Nothing here right now. 🎉</div>');
     foot();
 
 // ── invoice register (list + filters + Excel) ─────────────────────────────
@@ -569,6 +586,7 @@ case 'cash':
 
 // ── statement: every money movement with running balance ─────────────────
 case 'statement':
+    need('statement');
     $from = date_or_null($_GET['from'] ?? '') ?? date('Y-m-01');
     $to   = date_or_null($_GET['to'] ?? '') ?? date('Y-m-d');
     $open = q('SELECT COALESCE(SUM(amount), 0) FROM statement WHERE entry_date < ?', [$from])->fetchColumn();

@@ -140,16 +140,17 @@ const ROLES = ['administrator' => 'Administrator: makes requests', 'admin' => 'A
                'developer' => 'Developer: manages logins'];
 // who may do what; every permission check in the app goes through can()/need()
 const PERMS = [
-    'view'       => ['superadmin', 'admin', 'administrator'], // invoices, receipts, statement, files
-    'request'    => ['administrator'],                        // create/edit invoices, receipts, balance-change requests
-    'approve'    => ['admin'],
-    'pay'        => ['admin', 'administrator'],
-    'files'      => ['admin', 'administrator'],
+    'view'       => ['superadmin', 'admin', 'administrator'], // invoices, receipts, party outstanding, files
+    'request'    => ['administrator'],                        // create/edit invoices and receipts
+    'approve'    => ['admin'],                                // yes / no on requests sent to them
+    'pay'        => ['administrator'],                        // record payments against approved invoices
+    'files'      => ['administrator'],
     'chat'       => ['superadmin', 'admin', 'administrator'],
-    'manage'     => ['admin'],                                // remove payments, delete invoices/receipts
-    'balance'    => ['admin', 'administrator'],               // add / delete balance entries directly, no approval
-    'see_cash'   => ['superadmin', 'admin', 'administrator'],
-    'import'     => ['admin', 'administrator'],
+    'manage'     => ['admin'],                                // corrections: remove a payment, delete an invoice/receipt
+    'balance'    => ['administrator'],                        // add / delete balance entries directly, no approval
+    'see_cash'   => ['superadmin', 'administrator'],
+    'statement'  => ['superadmin', 'administrator'],
+    'import'     => ['administrator'],
     'users'      => ['developer'],
     'see_users'  => ['superadmin', 'developer'],
 ];
@@ -314,6 +315,25 @@ function pending_for_me(): int
 {
     return can('approve') ? (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending' AND (approver_id = ? OR approver_id IS NULL)", [me()['id']])->fetchColumn() : 0;
 }
+const REQUESTS_SQL = 'SELECT r.*, u.name AS by_name, v.name AS approver FROM requests r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.approver_id';
+function requests_for_me(): array
+{
+    return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND (r.approver_id = ? OR r.approver_id IS NULL) ORDER BY r.created_at", [me()['id']])->fetchAll();
+}
+function requests_table(array $rows, callable $date): void
+{ ?>
+    <div class="tbl stack"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><?= can('approve') ? '<th>Your decision</th>' : '' ?></tr></thead><tbody>
+    <?php foreach ($rows as $r): ?>
+      <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
+        <td class="wrap"><a href="<?= $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables' ?>"><?= h($r['detail']) ?></a>
+          <?= $r['status'] === 'rejected' ? '<div class="sub neg">Reason: ' . h($r['reject_reason']) . '</div>' : '' ?></td>
+        <td class="right"><strong><?= money($r['amount']) ?></strong></td>
+        <td data-label="Requested by"><?= h($r['by_name']) ?><div class="sub"><?= $date($r['created_at']) ?></div></td><td data-label="Sent to"><?= h($r['approver'] ?? 'any admin') ?></td>
+        <td><?= badge($r['status']) ?></td>
+        <?php if (can('approve')): ?><td><?= review_buttons($r['type'], (int) $r['id'], $r['status']) ?></td><?php endif ?></tr>
+    <?php endforeach ?></tbody></table></div>
+<?php
+}
 function review_buttons(string $type, int $id, string $status): string
 {
     $f = fn($a, $inner) => '<form method="post" action="?p=approvals" class="inline">' . csrf_field() . "<input type=\"hidden\" name=\"type\" value=\"$type\"><input type=\"hidden\" name=\"id\" value=\"$id\"><input type=\"hidden\" name=\"a\" value=\"$a\">$inner</form>";
@@ -348,7 +368,7 @@ function head(string $title, string $actions = ''): void
     $cur = $_GET['p'] ?? 'home';
     $nav = [['home', '📊', 'Dashboard', 'view'], ['approvals', '✅', 'Approvals', 'view'], ['payments', '🧾', 'Invoices', 'view'],
             ['outstanding', '📌', 'Party outstanding', 'view'], ['receivables', '💰', 'Receipts', 'view'], ['cash', '🏦', 'Balance', 'see_cash'],
-            ['statement', '📒', 'Statement', 'view'], ['chat', '💬', 'Team chat', 'chat'], ['import', '📥', 'Import Excel', 'import'],
+            ['statement', '📒', 'Statement', 'statement'], ['chat', '💬', 'Team chat', 'chat'], ['import', '📥', 'Import Excel', 'import'],
             ['users', '👥', 'Users', 'see_users']];
     $count = $u ? pending_for_me() : 0; ?>
 <!doctype html>
@@ -358,7 +378,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=10">
+<link rel="stylesheet" href="style.css?v=14">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
