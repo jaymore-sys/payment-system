@@ -300,7 +300,7 @@ function review(string $type, int $id, bool $approve, string $reason = ''): void
     need('approve');
     $table = REVIEWABLE[$type] ?? fail('Unknown request type');
     $r = q("SELECT status, approver_id FROM $table WHERE id = ?", [$id])->fetch() ?: fail('Request not found', 404);
-    if ($r['approver_id'] && $r['approver_id'] != me()['id']) fail('This request was sent to another admin.', 403);
+    if (!approver_free($r['approver_id'] !== null ? (int) $r['approver_id'] : null)) fail('This request was sent to another admin.', 403);
     if ($approve) {
         if ($r['status'] === 'approved') fail('Already approved');
         q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [me()['id'], $id]);
@@ -311,18 +311,24 @@ function review(string $type, int $id, bool $approve, string $reason = ''): void
     if ($type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
     q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?", [me()['id'], $reason, $id]);
 }
+// requests for me, plus any whose chosen approver is no longer an admin (role changed), so nothing gets stuck
+const MINE_SQL = "(approver_id = ? OR approver_id IS NULL OR approver_id NOT IN (SELECT id FROM users WHERE role = 'admin'))";
+function approver_free(?int $approver): bool
+{
+    return !$approver || $approver === (int) me()['id'] || !q("SELECT 1 FROM users WHERE id = ? AND role = 'admin'", [$approver])->fetch();
+}
 function pending_for_me(): int
 {
-    return can('approve') ? (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending' AND (approver_id = ? OR approver_id IS NULL)", [me()['id']])->fetchColumn() : 0;
+    return can('approve') ? (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending' AND " . MINE_SQL, [me()['id']])->fetchColumn() : 0;
 }
 const REQUESTS_SQL = 'SELECT r.*, u.name AS by_name, v.name AS approver FROM requests r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.approver_id';
 function requests_for_me(): array
 {
-    return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND (r.approver_id = ? OR r.approver_id IS NULL) ORDER BY r.created_at", [me()['id']])->fetchAll();
+    return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND " . str_replace('approver_id', 'r.approver_id', MINE_SQL) . " ORDER BY r.created_at", [me()['id']])->fetchAll();
 }
 function requests_table(array $rows, callable $date): void
 { ?>
-    <div class="tbl stack"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><?= can('approve') ? '<th>Your decision</th>' : '' ?></tr></thead><tbody>
+    <div class="tbl"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><?= can('approve') ? '<th>Your decision</th>' : '' ?></tr></thead><tbody>
     <?php foreach ($rows as $r): ?>
       <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
         <td class="wrap"><a href="<?= $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables' ?>"><?= h($r['detail']) ?></a>
@@ -374,11 +380,14 @@ function head(string $title, string $actions = ''): void
 <!doctype html>
 <html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?= h($title) ?> · Valencia Payment Desk</title>
-<link rel="icon" href="vnl-logo.webp">
+<link rel="icon" href="icon-192.png">
+<link rel="manifest" href="manifest.json"><link rel="apple-touch-icon" href="icon-180.png">
+<meta name="theme-color" content="#ff5733"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Payment Desk">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=14">
+<link rel="stylesheet" href="style.css?v=16">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
@@ -426,6 +435,14 @@ if (box) {
     box.scrollTop = box.scrollHeight;
   }, 5000);
 }
+// phones: tables turn into cards (CSS); give each cell its column name as a label
+document.querySelectorAll('.tbl table').forEach(t => {
+  const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.trim());
+  t.querySelectorAll('tbody tr, tfoot tr').forEach(tr => {
+    let col = 0;
+    [...tr.cells].forEach(c => { if (col > 0 && heads[col] && !c.dataset.label) c.dataset.label = heads[col]; col += c.colSpan; });
+  });
+});
 // "Add new…" in party/product dropdowns shows a text box
 document.querySelectorAll('select[data-addnew]').forEach(s => {
   const box = s.nextElementSibling;

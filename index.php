@@ -72,7 +72,7 @@ case 'home':
     $popup = ($dues || $mine) && empty($_SESSION['dues_seen']);
     if ($popup) $_SESSION['dues_seen'] = true;
     $due_table = function (int $limit = 10, bool $approval = true) use ($dues, $date) { ?>
-      <div class="tbl stack"><table><thead><tr><th>Party</th><th>Invoice</th><th class="right">Outstanding</th><th>Due</th><?= $approval ? '<th>Approval</th>' : '' ?></tr></thead><tbody>
+      <div class="tbl"><table><thead><tr><th>Party</th><th>Invoice</th><th class="right">Outstanding</th><th>Due</th><?= $approval ? '<th>Approval</th>' : '' ?></tr></thead><tbody>
       <?php foreach (array_slice($dues, 0, $limit) as $d): ?>
         <tr><td class="clip"><a href="?p=payment&id=<?= $d['id'] ?>" title="<?= h($d['party']) ?>"><?= h($d['party']) ?></a></td><td><?= h($d['invoice_no'] ?: $d['products']) ?></td>
           <td class="right"><strong><?= money($d['outstanding']) ?></strong></td>
@@ -268,8 +268,28 @@ case 'payment':
             if (!$editable) fail('This invoice cannot be edited by you', 403);
             $amount = amount_in($_POST['amount'] ?? '');
             if ($pm && paise($amount) < paise($pm['paid'])) fail('Amount cannot be less than what is already paid (' . money($pm['paid']) . ')');
-            $f = [party_id(picked('party')), trim($_POST['invoice_no'] ?? '') ?: null, date_in($_POST['invoice_date'] ?? ''), product_name(picked('product')),
-                  enum_in($_POST['bill_type'] ?? '', ['gst', 'cash']), $amount, date_in($_POST['due_date'] ?? ''), approver_in()];
+            [$party, $product] = [picked('party'), picked('product')];
+            $f = [trim($_POST['invoice_no'] ?? '') ?: null, date_in($_POST['invoice_date'] ?? ''), enum_in($_POST['bill_type'] ?? '', ['gst', 'cash']),
+                  $amount, date_in($_POST['due_date'] ?? ''), approver_in()];
+            // same invoice no. already entered for this party? warn (possible double payment), allow "Save anyway"
+            if ($f[0] !== null && empty($_POST['dup_ok'])) {
+                $dups = q('SELECT pm.id, pm.invoice_date, pm.amount FROM payments pm JOIN parties p ON p.id = pm.party_id
+                           WHERE p.name = ? AND pm.invoice_no = ? AND pm.id <> ?', [$party, $f[0], $id])->fetchAll();
+                if ($dups) {
+                    head('Possible duplicate invoice'); ?>
+                    <div class="error-box">⚠️ Invoice no. <strong><?= h($f[0]) ?></strong> already exists for <strong><?= h($party) ?></strong>. Entering it again could mean paying twice.</div>
+                    <div class="panel" style="margin-top:1rem"><strong>Already in the app:</strong><ul>
+                      <?php foreach ($dups as $d): ?><li><a href="?p=payment&id=<?= $d['id'] ?>" target="_blank">Invoice #<?= $d['id'] ?></a> · <?= $date($d['invoice_date']) ?> · <?= money($d['amount']) ?></li><?php endforeach ?>
+                    </ul>
+                    <form method="post"><?= csrf_field() ?>
+                      <?php foreach ($_POST as $k => $v) if (is_string($v) && $k !== 'csrf') echo '<input type="hidden" name="' . h($k) . '" value="' . h($v) . '">'; ?>
+                      <input type="hidden" name="dup_ok" value="1">
+                      <div class="row"><a href="javascript:history.back()" role="button" class="secondary">← Go back and fix</a><button>Save anyway</button></div>
+                    </form></div>
+                    <?php foot();
+                }
+            }
+            $f = [party_id($party), $f[0], $f[1], product_name($product), ...array_slice($f, 2)]; // names saved only once everything is valid
             if (!$pm) {
                 q('INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, due_date, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [...$f, $uid]);
                 $id = (int) db()->lastInsertId();
@@ -296,6 +316,7 @@ case 'payment':
             break;
         case 'delete':
             need('manage');
+            if (q('SELECT 1 FROM payouts WHERE payment_id = ? AND in_balance', [$id])->fetch()) fail('Payments are recorded against this invoice. Remove them first, then delete the invoice.');
             foreach (q('SELECT file_path FROM attachments WHERE payment_id = ?', [$id])->fetchAll(PDO::FETCH_COLUMN) as $fp) @unlink(upload_dir() . '/' . basename($fp));
             q('DELETE FROM payments WHERE id = ?', [$id]);
             go('?p=payments', "Invoice #$id deleted");
@@ -350,7 +371,7 @@ case 'payment':
           <?php if ($pm['days_overdue'] > 0): ?><div class="sub neg"><?= (int) $pm['days_overdue'] ?> days overdue</div><?php endif ?></article>
       </div>
       <?php if ($pm['status'] === 'rejected'): ?><div class="error-box">❌ Rejected: <?= h($pm['reject_reason']) ?></div><?php endif ?>
-      <?php if (can('approve') && $pm['status'] !== 'approved' && (!$pm['approver_id'] || $pm['approver_id'] == $uid)): ?>
+      <?php if (can('approve') && $pm['status'] !== 'approved' && approver_free($pm['approver_id'] ? (int) $pm['approver_id'] : null)): ?>
         <div class="panel"><strong>Your decision</strong><br><br><?= review_buttons('invoice', $id, $pm['status']) ?></div>
       <?php elseif ($pm['status'] === 'pending'): ?>
         <p class="note">⏳ Waiting for <?= h($pm['approver'] ?? 'an admin') ?> to approve.</p>
@@ -488,7 +509,7 @@ case 'receivables':
         }
         need('request');
         q('INSERT INTO receivables (party_id, amount, received_on, against, note, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)', [
-            party_id(picked('party'), isset($_POST['gst']), $_POST['gstin'] ?? ''), amount_in($_POST['amount'] ?? ''), date_in($_POST['received_on'] ?? ''),
+            party_id(picked('party'), isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? ''), amount_in($_POST['amount'] ?? ''), date_in($_POST['received_on'] ?? ''),
             enum_in($_POST['against'] ?? '', ['sales', 'capital']), trim($_POST['note'] ?? '') ?: null, approver_in(), me()['id']]);
         go('?p=receivables', 'Receipt sent for approval');
     }
