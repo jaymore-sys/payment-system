@@ -144,7 +144,7 @@ case 'approvals':
         $rows = q("$base WHERE r.status = 'pending' AND (r.approver_id = ? OR r.approver_id IS NULL) ORDER BY r.created_at", [me()['id']])->fetchAll();
         $title = 'Waiting for your approval';
     } elseif (can('request')) {
-        $rows = q("$base WHERE r.created_by = ? ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
+        $rows = q("$base WHERE r.created_by = ? AND r.approver_id IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
         $title = 'My requests';
     } else {
         $rows = q("$base WHERE r.status = 'pending' ORDER BY r.created_at")->fetchAll();
@@ -203,19 +203,19 @@ case 'payments':
         <?php foreach (q('SELECT name FROM products ORDER BY name')->fetchAll(PDO::FETCH_COLUMN) as $n): ?><option <?= $sel('product', $n) ?>><?= h($n) ?></option><?php endforeach ?></select></label>
       <button>Filter</button>
     </form>
-    <div class="tbl"><table><thead><tr><th>Invoice date</th><th>Invoice no.</th><th>Party</th><th class="right">Amount</th><th class="right">Paid</th>
-      <th class="right">Outstanding</th><th>Due</th><th class="right">Days overdue</th><th>Payment</th><th>Approval</th><th>Product / remarks</th></tr></thead><tbody>
+    <div class="tbl"><table class="dense"><thead><tr><th>Invoice</th><th>Party</th><th class="right">Amount</th><th class="right">Paid</th>
+      <th class="right">Outstanding</th><th>Due</th><th>Status</th><th>Product / remarks</th></tr></thead><tbody>
     <?php foreach ($rows as $r): ?>
-      <tr><td><?= $date($r['invoice_date']) ?></td>
-        <td><a href="?p=payment&id=<?= $r['id'] ?>"><?= h($r['invoice_no'] ?: '#' . $r['id']) ?></a></td>
-        <td><a href="?p=payment&id=<?= $r['id'] ?>"><?= h($r['party']) ?></a></td>
+      <tr><td><a href="?p=payment&id=<?= $r['id'] ?>"><strong><?= h($r['invoice_no'] ?: '#' . $r['id']) ?></strong></a><div class="sub"><?= $date($r['invoice_date']) ?></div></td>
+        <td class="wrap"><a href="?p=payment&id=<?= $r['id'] ?>"><?= h($r['party']) ?></a></td>
         <td class="right"><?= money($r['amount']) ?></td><td class="right pos"><?= money($r['paid']) ?></td><td class="right"><strong><?= money($r['outstanding']) ?></strong></td>
-        <td><?= $date($r['due_date']) ?></td><td class="right <?= $r['days_overdue'] > 0 ? 'neg' : '' ?>"><?= (int) $r['days_overdue'] ?></td>
-        <td><?= badge($r['pay_status']) ?></td><td><?= badge($r['status']) ?></td><td><?= h(mb_strimwidth($r['products'], 0, 40, '…')) ?></td></tr>
+        <td><?= $date($r['due_date']) ?><?= $r['days_overdue'] > 0 ? '<div class="sub neg">' . (int) $r['days_overdue'] . ' days overdue</div>' : '' ?></td>
+        <td><?= badge($r['pay_status']) ?><?= $r['status'] !== 'approved' ? ' ' . badge($r['status']) : '' ?></td>
+        <td class="wrap"><?= h(mb_strimwidth($r['products'], 0, 32, '…')) ?></td></tr>
     <?php endforeach;
-    if (!$rows): ?><tr><td colspan="11" class="empty">No invoices match.</td></tr><?php endif ?></tbody>
-    <tfoot><tr><th colspan="3"><?= count($rows) ?> invoices · totals exclude rejected</th><th class="right"><?= money($t['invoiced']) ?></th>
-      <th class="right"><?= money($t['paid']) ?></th><th class="right"><?= money($t['outstanding']) ?></th><th colspan="5"></th></tr></tfoot></table></div>
+    if (!$rows): ?><tr><td colspan="8" class="empty">No invoices match.</td></tr><?php endif ?></tbody>
+    <tfoot><tr><th colspan="2"><?= count($rows) ?> invoices · totals exclude rejected</th><th class="right"><?= money($t['invoiced']) ?></th>
+      <th class="right"><?= money($t['paid']) ?></th><th class="right"><?= money($t['outstanding']) ?></th><th colspan="3"></th></tr></tfoot></table></div>
     <?php foot();
 
 // ── party-wise outstanding ────────────────────────────────────────────────
@@ -330,11 +330,10 @@ case 'payment':
         <article class="stat green" data-icon="💸"><small>Paid</small><div class="big pos"><?= money($pm['paid']) ?></div></article>
         <article class="stat" data-icon="📌"><small>Outstanding</small><div class="big <?= $pm['outstanding'] > 0 ? 'neg' : '' ?>"><?= money($pm['outstanding']) ?></div></article>
         <article class="stat <?= $pm['days_overdue'] > 0 ? 'red' : 'blue' ?>" data-icon="📅"><small>Due date</small><div class="big"><?= $date($pm['due_date']) ?></div>
-          <?php if ($pm['days_overdue'] > 0): ?><small class="neg"><?= (int) $pm['days_overdue'] ?> days overdue</small><?php endif ?></article>
+          <?php if ($pm['days_overdue'] > 0): ?><div class="sub neg"><?= (int) $pm['days_overdue'] ?> days overdue</div><?php endif ?></article>
       </div>
       <?php if ($pm['status'] === 'rejected'): ?><div class="error-box">❌ Rejected: <?= h($pm['reject_reason']) ?></div><?php endif ?>
-      <?php if (can('approve') && $pm['outstanding'] > 0 && ($pm['status'] !== 'approved' || $pm['paid'] == 0)
-                && (!$pm['approver_id'] || $pm['approver_id'] == $uid)): ?>
+      <?php if (can('approve') && $pm['status'] !== 'approved' && (!$pm['approver_id'] || $pm['approver_id'] == $uid)): ?>
         <div class="panel"><strong>Your decision</strong><br><br><?= review_buttons('invoice', $id, $pm['status']) ?></div>
       <?php elseif ($pm['status'] === 'pending'): ?>
         <p class="note">⏳ Waiting for <?= h($pm['approver'] ?? 'an admin') ?> to approve.</p>
@@ -402,7 +401,7 @@ case 'payment':
       <?php endforeach ?></ul><?php endif ?>
       <?php if (can('files')): ?>
       <form method="post" enctype="multipart/form-data"><?= csrf_field() ?><input type="hidden" name="a" value="upload">
-        <fieldset role="group"><input type="file" name="file" accept="image/*,.pdf,.xls,.xlsx" required><button>Upload</button></fieldset></form>
+        <div class="row"><input type="file" name="file" accept="image/*,.pdf,.xls,.xlsx" required><button>⬆ Upload</button></div></form>
       <?php endif ?>
 
       <h3>💬 Discussion & follow-ups</h3>
@@ -410,7 +409,7 @@ case 'payment':
       <?php if (can('chat')): ?>
       <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="msg">
         <textarea name="body" placeholder="Write a message…" required></textarea>
-        <fieldset role="group"><select name="kind"><option value="chat">💬 Chat</option><option value="followup">📌 Follow-up note</option></select><button>Send</button></fieldset></form>
+        <div class="row end"><select name="kind"><option value="chat">💬 Chat</option><option value="followup">📌 Follow-up note</option></select><button>Send</button></div></form>
       <?php endif ?>
 
       <?php if (can('manage')): ?>
@@ -499,7 +498,7 @@ case 'receivables':
         <div class="grid">
           <label>Against<select name="against"><option value="sales">Sales</option><option value="capital">Capital</option></select></label>
           <label>GSTIN (optional)<input name="gstin" maxlength="15"></label>
-          <label><br><input type="checkbox" name="gst" value="1"> Party is GST registered</label></div>
+          <label class="check"><input type="checkbox" name="gst" value="1"> Party is GST registered</label></div>
         <div class="grid"><label>Note<input name="note" placeholder="optional"></label><?= approver_select() ?></div>
         <button>📨 Send for approval</button>
       </form>
@@ -574,16 +573,16 @@ case 'statement':
     $to   = date_or_null($_GET['to'] ?? '') ?? date('Y-m-d');
     $open = q('SELECT COALESCE(SUM(amount), 0) FROM statement WHERE entry_date < ?', [$from])->fetchColumn();
     $rows = q('SELECT entry_date AS date, kind, detail, ref_id, amount,
-                      CAST(? AS DECIMAL(14,2)) + SUM(amount) OVER (ORDER BY entry_date, kind, row_id ROWS UNBOUNDED PRECEDING) AS balance
-               FROM statement WHERE entry_date BETWEEN ? AND ? ORDER BY entry_date, kind, row_id', [$open, $from, $to])->fetchAll();
+                      CAST(? AS DECIMAL(14,2)) + SUM(amount) OVER (ORDER BY entry_date, kind <> \'opening\', kind, row_id ROWS UNBOUNDED PRECEDING) AS balance
+               FROM statement WHERE entry_date BETWEEN ? AND ? ORDER BY entry_date, kind <> \'opening\', kind, row_id', [$open, $from, $to])->fetchAll();
     if (isset($_GET['csv'])) csv('statement', $rows);
     $in  = array_sum(array_filter(array_column($rows, 'amount'), fn($v) => $v > 0));
     $out = array_sum(array_filter(array_column($rows, 'amount'), fn($v) => $v < 0));
-    head('Statement'); ?>
+    head('Statement', '<a href="?p=statement&csv=1&from=' . h($from) . '&to=' . h($to) . '" role="button" class="secondary">⬇ Excel (CSV)</a>'); ?>
     <form class="filters panel"><input type="hidden" name="p" value="statement">
       <label>From<input type="date" name="from" value="<?= h($from) ?>"></label>
       <label>To<input type="date" name="to" value="<?= h($to) ?>"></label>
-      <button>Show</button><button name="csv" value="1" class="secondary">⬇ Excel (CSV)</button>
+      <button>Show</button>
     </form>
     <div class="stats">
       <article class="stat blue" data-icon="📂"><small>Opening</small><div class="big"><?= money($open) ?></div></article>
@@ -626,7 +625,7 @@ case 'import':
         <li>Uploading the same file again skips invoices that are already in the app.</li>
       </ul>
       <form method="post" enctype="multipart/form-data"><?= csrf_field() ?>
-        <fieldset role="group"><input type="file" name="file" accept=".xlsx" required><button>📥 Import</button></fieldset></form>
+        <div class="row"><input type="file" name="file" accept=".xlsx" required><button>📥 Import</button></div></form>
     </div>
     <?php foot();
 
