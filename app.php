@@ -83,6 +83,24 @@ const MIGRATIONS = [
         "UPDATE payments SET status = 'approved' WHERE status = 'paid'",
         "ALTER TABLE payments MODIFY status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending', DROP COLUMN paid_on",
     ],
+    4 => [ // product list, "send request to" approver, approval for receipts and balance entries, imported payouts
+        "DROP VIEW IF EXISTS requests, upcoming_dues, current_balance, statement, payment_register",
+        "CREATE TABLE products (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL UNIQUE,
+           created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "INSERT IGNORE INTO products (name) SELECT DISTINCT LEFT(TRIM(products), 190) FROM payments WHERE TRIM(products) <> ''",
+        "ALTER TABLE payments ADD COLUMN approver_id INT AFTER status, ADD FOREIGN KEY (approver_id) REFERENCES users(id)",
+        "ALTER TABLE payouts ADD COLUMN in_balance BOOLEAN NOT NULL DEFAULT TRUE AFTER note",
+        "ALTER TABLE receivables ADD COLUMN status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending' AFTER note,
+           ADD COLUMN approver_id INT AFTER status, ADD COLUMN reject_reason TEXT AFTER approver_id, ADD COLUMN reviewed_by INT AFTER reject_reason,
+           ADD FOREIGN KEY (approver_id) REFERENCES users(id), ADD FOREIGN KEY (reviewed_by) REFERENCES users(id),
+           ADD CONSTRAINT receipt_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> '')",
+        "UPDATE receivables SET status = 'approved'", // existing receipts already counted in the balance
+        "ALTER TABLE cash_entries ADD COLUMN status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending' AFTER note,
+           ADD COLUMN approver_id INT AFTER status, ADD COLUMN reject_reason TEXT AFTER approver_id, ADD COLUMN reviewed_by INT AFTER reject_reason,
+           ADD FOREIGN KEY (approver_id) REFERENCES users(id), ADD FOREIGN KEY (reviewed_by) REFERENCES users(id),
+           ADD CONSTRAINT cash_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> '')",
+        "UPDATE cash_entries SET status = 'approved'",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -108,14 +126,15 @@ const ROLES = ['administrator' => 'Administrator: makes requests', 'admin' => 'A
                'developer' => 'Developer: manages logins'];
 // who may do what; every permission check in the app goes through can()/need()
 const PERMS = [
-    'view'       => ['superadmin', 'admin', 'administrator'], // payments, receipts, statement, files
-    'request'    => ['administrator'],                        // create/edit payments & receipts, due dates
+    'view'       => ['superadmin', 'admin', 'administrator'], // invoices, receipts, statement, files
+    'request'    => ['administrator'],                        // create/edit invoices, receipts, balance-change requests
     'approve'    => ['admin'],
     'pay'        => ['admin', 'administrator'],
     'files'      => ['admin', 'administrator'],
     'chat'       => ['superadmin', 'admin', 'administrator'],
-    'manage'     => ['admin'],                                // balance entries, undo paid, deletes
-    'see_cash'   => ['superadmin', 'admin'],
+    'manage'     => ['admin'],                                // direct balance entries, remove payments, deletes
+    'see_cash'   => ['superadmin', 'admin', 'administrator'],
+    'import'     => ['admin', 'administrator'],
     'users'      => ['developer'],
     'see_users'  => ['superadmin', 'developer'],
 ];
@@ -134,7 +153,7 @@ function fail(string $msg, int $code = 400): never
 {
     http_response_code($code);
     head('Error');
-    echo '<p>' . h($msg) . '</p><p><a href="javascript:history.back()">← Go back</a></p>';
+    echo '<div class="error-box">⚠️ ' . h($msg) . '</div><p><a href="javascript:history.back()">← Go back</a></p>';
     foot();
 }
 function req(string $k): string
@@ -221,16 +240,77 @@ function summarize(array $rows): array
     uasort($parties, fn($a, $b) => $b['outstanding'] <=> $a['outstanding']);
     return [$t, $parties];
 }
-function parties_datalist(): string
+// <select> from a master list (parties / products) with an "Add new…" choice that shows a text box (JS in foot())
+function pick(string $name, string $table, ?string $current, string $label): string
+{
+    $names = q("SELECT name FROM $table ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
+    if ((string) $current !== '' && !in_array($current, $names, true)) $names[] = $current;
+    $o = '<option value="">— Select ' . h(strtolower($label)) . ' —</option>';
+    foreach ($names as $n) $o .= '<option value="' . h($n) . '"' . ($n === $current ? ' selected' : '') . '>' . h($n) . '</option>';
+    $o .= '<option value="__new">➕ Add new ' . h(strtolower($label)) . '…</option>';
+    return "<label>$label<select name=\"$name\" data-addnew required>$o</select>"
+        . "<input name=\"{$name}_new\" placeholder=\"Type the new " . h(strtolower($label)) . ' name" maxlength="190" hidden></label>';
+}
+function picked(string $name): string
+{
+    $v = trim((string) ($_POST[$name] ?? ''));
+    if ($v === '__new') $v = trim((string) ($_POST[$name . '_new'] ?? ''));
+    return $v !== '' ? mb_substr(preg_replace('/\s+/', ' ', $v), 0, 190) : fail("Please choose or add a $name");
+}
+function product_name(string $n): string
+{
+    q('INSERT IGNORE INTO products (name) VALUES (?)', [$n]);
+    return $n;
+}
+
+// "Send request to": the admin who must approve. Only that admin can say yes/no.
+function approver_select(?int $current = null): string
 {
     $o = '';
-    foreach (q('SELECT name FROM parties ORDER BY name')->fetchAll(PDO::FETCH_COLUMN) as $n) $o .= '<option value="' . h($n) . '">';
-    return "<datalist id=\"parties\">$o</datalist>";
+    foreach (q("SELECT id, name FROM users WHERE role = 'admin' ORDER BY name")->fetchAll() as $u) {
+        $o .= '<option value="' . $u['id'] . '"' . ($u['id'] == $current ? ' selected' : '') . '>' . h($u['name']) . '</option>';
+    }
+    return $o ? "<label>📨 Send request to<select name=\"approver\" required>$o</select></label>"
+              : '<p class="neg">No Admin login exists yet. Ask the Developer to create one.</p>';
 }
+function approver_in(): int
+{
+    $id = (int) ($_POST['approver'] ?? 0);
+    return q("SELECT 1 FROM users WHERE id = ? AND role = 'admin'", [$id])->fetch() ? $id : fail('Choose which admin to send the request to');
+}
+const REVIEWABLE = ['invoice' => 'payments', 'receipt' => 'receivables', 'balance' => 'cash_entries'];
+function review(string $type, int $id, bool $approve, string $reason = ''): void
+{
+    need('approve');
+    $table = REVIEWABLE[$type] ?? fail('Unknown request type');
+    $r = q("SELECT status, approver_id FROM $table WHERE id = ?", [$id])->fetch() ?: fail('Request not found', 404);
+    if ($r['approver_id'] && $r['approver_id'] != me()['id']) fail('This request was sent to another admin.', 403);
+    if ($approve) {
+        if ($r['status'] === 'approved') fail('Already approved');
+        q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [me()['id'], $id]);
+        return;
+    }
+    if ($reason === '') fail('Please give a reason for rejecting');
+    if ($r['status'] === 'rejected') fail('Already rejected');
+    if ($type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
+    q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?", [me()['id'], $reason, $id]);
+}
+function pending_for_me(): int
+{
+    return can('approve') ? (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending' AND (approver_id = ? OR approver_id IS NULL)", [me()['id']])->fetchColumn() : 0;
+}
+function review_buttons(string $type, int $id, string $status): string
+{
+    $f = fn($a, $inner) => '<form method="post" action="?p=approvals" class="inline">' . csrf_field() . "<input type=\"hidden\" name=\"type\" value=\"$type\"><input type=\"hidden\" name=\"id\" value=\"$id\"><input type=\"hidden\" name=\"a\" value=\"$a\">$inner</form>";
+    return '<div class="review">' . ($status !== 'approved' ? $f('approve', '<button class="ok">✅ Approve</button>') : '')
+        . ($status !== 'rejected' ? $f('reject', '<input name="reason" placeholder="Reason to reject" required><button class="no">❌ Reject</button>') : '') . '</div>';
+}
+
 function msg_html(array $m): string
 {
-    return '<div class="msg' . ($m['kind'] === 'followup' ? ' followup' : '') . '" data-id="' . (int) $m['id'] . '"><b>' . h($m['name']) . '</b> <small>'
-        . h(date('d M, H:i', strtotime($m['created_at']))) . ($m['kind'] === 'followup' ? ' · follow-up' : '') . '</small><br>' . nl2br(h($m['body'])) . '</div>';
+    $mine = (int) $m['user_id'] === (int) (me()['id'] ?? 0);
+    return '<div class="msg' . ($mine ? ' mine' : '') . ($m['kind'] === 'followup' ? ' followup' : '') . '" data-id="' . (int) $m['id'] . '"><b>' . h($m['name']) . '</b> <small>'
+        . h(date('d M, H:i', strtotime($m['created_at']))) . ($m['kind'] === 'followup' ? ' · 📌 follow-up' : '') . '</small><div>' . nl2br(h($m['body'])) . '</div></div>';
 }
 function csv(string $name, array $rows): never
 {
@@ -245,46 +325,49 @@ function csv(string $name, array $rows): never
     exit;
 }
 
-function head(string $title): void
+function head(string $title, string $actions = ''): void
 {
     $u = me();
     $flash = $_SESSION['flash'] ?? null;
-    unset($_SESSION['flash']); ?>
+    unset($_SESSION['flash']);
+    $cur = $_GET['p'] ?? 'home';
+    $nav = [['home', '📊', 'Dashboard', 'view'], ['approvals', '✅', 'Approvals', 'view'], ['payments', '🧾', 'Invoices', 'view'],
+            ['outstanding', '📌', 'Party outstanding', 'view'], ['receivables', '💰', 'Receipts', 'view'], ['cash', '🏦', 'Balance', 'see_cash'],
+            ['statement', '📒', 'Statement', 'view'], ['chat', '💬', 'Team chat', 'chat'], ['import', '📥', 'Import Excel', 'import'],
+            ['users', '👥', 'Users', 'see_users']];
+    $count = $u ? pending_for_me() : 0; ?>
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title><?= h($title) ?> · Payments</title>
+<html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title><?= h($title) ?> · Payment Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<style>
-nav ul{flex-wrap:wrap}
-.badge{padding:.1rem .55rem;border-radius:1rem;font-size:.8rem;color:#111;white-space:nowrap}
-.pending{background:#fde68a}.approved{background:#bfdbfe}.rejected{background:#fecaca}.paid{background:#bbf7d0}.part{background:#fed7aa}.unpaid{background:#e5e7eb}
-.neg{color:#dc2626}.pos{color:#16a34a}.right{text-align:right}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
-.cards article{margin:0}.big{font-size:clamp(1.3rem,2.4vw,1.8rem);font-weight:700;white-space:nowrap}
-nav li{padding-block:.3rem}td:first-child{white-space:nowrap}
-.filters{display:flex;flex-wrap:wrap;gap:.5rem;align-items:flex-end}.filters>*{flex:1 1 140px;margin:0}
-#chat{max-height:55vh;overflow:auto;border:1px solid var(--pico-muted-border-color);padding:.75rem;border-radius:.5rem;margin-bottom:1rem}
-.msg{margin-bottom:.7rem}.followup{border-left:3px solid #f59e0b;padding-left:.5rem}
-.flash{background:#bbf7d0;color:#111;padding:.5rem 1rem;border-radius:.5rem}
-form.inline{display:inline}form.inline button{padding:.2rem .6rem;margin:0;width:auto}
-td form{margin:0}
-table.striped td,table.striped th{white-space:nowrap}details{margin-top:1rem}
-</style></head>
-<body><header class="container"><nav>
-<ul><li><strong>💰 Payments</strong></li></ul>
-<?php if ($u): ?><ul>
-<?php if (can('view')): ?>
-<li><a href="?">Dashboard</a></li><li><a href="?p=payments">Invoices</a></li><li><a href="?p=outstanding">Outstanding</a></li><li><a href="?p=receivables">Receivables</a></li>
-<li><a href="?p=statement">Statement</a></li><li><a href="?p=chat">Chat</a></li>
+<link rel="stylesheet" href="style.css?v=6">
+</head>
+<body class="<?= $u ? 'app' : 'auth' ?>">
+<?php if ($u): ?>
+<input type="checkbox" id="nav-toggle" hidden>
+<aside class="side">
+  <a class="brand" href="?"><span class="logo">₹</span><span>Payment Desk</span></a>
+  <nav>
+  <?php foreach ($nav as [$p, $icon, $label, $perm]): if (!can($perm)) continue; ?>
+    <a href="?p=<?= $p ?>" class="<?= $p === $cur ? 'active' : '' ?>"><span class="ico"><?= $icon ?></span><?= $label ?>
+      <?php if ($p === 'approvals' && $count): ?><b class="count"><?= $count ?></b><?php endif ?></a>
+  <?php endforeach ?>
+  </nav>
+  <div class="me"><span class="avatar"><?= h(mb_strtoupper(mb_substr($u['name'], 0, 1))) ?></span>
+    <div><strong><?= h($u['name']) ?></strong><small><?= h(ucfirst($u['role'])) ?></small></div>
+    <a href="?p=logout" title="Log out">⏻</a></div>
+</aside>
+<header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><span class="logo">₹</span><strong>Payment Desk</strong>
+  <?php if ($count): ?><a class="count" href="?p=approvals"><?= $count ?></a><?php endif ?></header>
+<label for="nav-toggle" class="scrim"></label>
+<main class="content">
+<?php else: ?>
+<main class="auth-box"><div class="brand"><span class="logo">₹</span><span>Payment Desk</span></div>
 <?php endif ?>
-<?php if (can('see_cash')): ?><li><a href="?p=cash">Balance entries</a></li><?php endif ?>
-<?php if (can('see_users')): ?><li><a href="?p=users">Users</a></li><?php endif ?>
-<li><a href="?p=logout">Logout (<?= h($u['name']) ?> · <?= h($u['role']) ?>)</a></li>
-</ul><?php endif ?>
-</nav></header>
-<main class="container">
-<?php if ($flash): ?><p class="flash"><?= h($flash) ?></p><?php endif ?>
-<h2><?= h($title) ?></h2>
+<?php if ($flash): ?><div class="flash">✅ <?= h($flash) ?></div><?php endif ?>
+<div class="page-head"><h1><?= h($title) ?></h1><?php if ($actions): ?><div class="actions"><?= $actions ?></div><?php endif ?></div>
 <?php
 }
 
@@ -306,6 +389,12 @@ if (box) {
     box.scrollTop = box.scrollHeight;
   }, 5000);
 }
+// "Add new…" in party/product dropdowns shows a text box
+document.querySelectorAll('select[data-addnew]').forEach(s => {
+  const box = s.nextElementSibling;
+  const sync = () => { const on = s.value === '__new'; box.hidden = !on; box.required = on; if (on) box.focus(); };
+  s.addEventListener('change', sync); sync();
+});
 </script>
 </body></html>
 <?php

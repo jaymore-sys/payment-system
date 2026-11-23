@@ -9,7 +9,7 @@
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   An invoice must be 'approved' before payouts are recorded against it.
+--   Invoices, receipts and balance changes are requests sent to one admin; only approved ones count.
 
 SET NAMES utf8mb4;
 
@@ -17,7 +17,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '3');
+INSERT INTO app_meta VALUES ('schema', '4');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -26,6 +26,13 @@ CREATE TABLE users (
   password_hash VARCHAR(255) NOT NULL,           -- PHP password_hash()
   role          ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator',
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- product / remarks names offered in the invoice dropdown
+CREATE TABLE products (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  name       VARCHAR(190) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE parties (
@@ -47,11 +54,13 @@ CREATE TABLE payments (
   amount        DECIMAL(14,2) NOT NULL,          -- invoice amount
   due_date      DATE NOT NULL,
   status        ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  approver_id   INT,                             -- admin the request was sent to
   reject_reason TEXT,
   reviewed_by   INT,
   created_by    INT NOT NULL,
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (party_id)    REFERENCES parties(id),
+  FOREIGN KEY (approver_id) REFERENCES users(id),
   FOREIGN KEY (reviewed_by) REFERENCES users(id),
   FOREIGN KEY (created_by)  REFERENCES users(id),
   CONSTRAINT amount_positive   CHECK (amount > 0),
@@ -66,6 +75,7 @@ CREATE TABLE payouts (
   amount     DECIMAL(14,2) NOT NULL,
   paid_on    DATE NOT NULL,
   note       VARCHAR(255),
+  in_balance BOOLEAN NOT NULL DEFAULT TRUE,      -- FALSE: paid before the app was used (Excel import)
   created_by INT NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE CASCADE,
@@ -81,24 +91,38 @@ CREATE TABLE receivables (
   received_on DATE NOT NULL,
   against     ENUM('sales','capital') NOT NULL,
   note        TEXT,
+  status      ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  approver_id INT,
+  reject_reason TEXT,
+  reviewed_by INT,
   created_by  INT NOT NULL,
   created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (party_id)   REFERENCES parties(id),
-  FOREIGN KEY (created_by) REFERENCES users(id),
+  FOREIGN KEY (party_id)    REFERENCES parties(id),
+  FOREIGN KEY (approver_id) REFERENCES users(id),
+  FOREIGN KEY (reviewed_by) REFERENCES users(id),
+  FOREIGN KEY (created_by)  REFERENCES users(id),
   CONSTRAINT receivable_positive CHECK (amount > 0),
+  CONSTRAINT receipt_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> ''),
   INDEX (received_on)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- admin-only: opening balance, corrections (+/−), other costs (−)
+-- opening balance, corrections (+/−), other costs (−); admin adds directly, administrator sends a request
 CREATE TABLE cash_entries (
   id         INT AUTO_INCREMENT PRIMARY KEY,
   entry_date DATE NOT NULL,
   amount     DECIMAL(14,2) NOT NULL,             -- + money in, − money out
   kind       ENUM('opening','adjustment','expense') NOT NULL,
   note       TEXT,
+  status     ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  approver_id INT,
+  reject_reason TEXT,
+  reviewed_by INT,
   created_by INT NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (approver_id) REFERENCES users(id),
+  FOREIGN KEY (reviewed_by) REFERENCES users(id),
   FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT cash_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> ''),
   CONSTRAINT entry_nonzero    CHECK (amount <> 0),
   CONSTRAINT expense_negative CHECK (kind <> 'expense' OR amount < 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -148,13 +172,27 @@ CREATE OR REPLACE VIEW payment_register AS
 -- every money movement in one list (reports: filter on entry_date)
 CREATE OR REPLACE VIEW statement AS
   SELECT c.entry_date, c.amount, c.kind, c.note AS detail, c.id AS ref_id, c.id AS row_id
-    FROM cash_entries c
+    FROM cash_entries c WHERE c.status = 'approved'
   UNION ALL
   SELECT r.received_on, r.amount, 'receipt', CONCAT(p.name, ' (', r.against, ')'), r.id, r.id
-    FROM receivables r JOIN parties p ON p.id = r.party_id
+    FROM receivables r JOIN parties p ON p.id = r.party_id WHERE r.status = 'approved'
   UNION ALL
   SELECT po.paid_on, -po.amount, 'payment', CONCAT(p.name, ': ', COALESCE(NULLIF(pm.invoice_no, ''), pm.products)), pm.id, po.id
-    FROM payouts po JOIN payments pm ON pm.id = po.payment_id JOIN parties p ON p.id = pm.party_id;
+    FROM payouts po JOIN payments pm ON pm.id = po.payment_id JOIN parties p ON p.id = pm.party_id WHERE po.in_balance;
+
+-- everything that needs an admin's yes/no, in one list (Approvals page)
+CREATE OR REPLACE VIEW requests AS
+  SELECT 'invoice' AS type, pm.id, CONCAT(p.name, IF(COALESCE(pm.invoice_no, '') <> '', CONCAT(' · ', pm.invoice_no), ''), ' · ', pm.products) AS detail,
+         pm.amount, pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
+    FROM payments pm JOIN parties p ON p.id = pm.party_id
+  UNION ALL
+  SELECT 'receipt', r.id, CONCAT(p.name, ' · against ', r.against, IF(COALESCE(r.note, '') <> '', CONCAT(' · ', r.note), '')),
+         r.amount, r.status, r.approver_id, r.reject_reason, r.created_by, r.created_at
+    FROM receivables r JOIN parties p ON p.id = r.party_id
+  UNION ALL
+  SELECT 'balance', c.id, CONCAT(c.kind, IF(COALESCE(c.note, '') <> '', CONCAT(' · ', c.note), '')),
+         c.amount, c.status, c.approver_id, c.reject_reason, c.created_by, c.created_at
+    FROM cash_entries c;
 
 CREATE OR REPLACE VIEW current_balance AS
   SELECT COALESCE(SUM(amount), 0) AS balance FROM statement;

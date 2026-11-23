@@ -131,6 +131,141 @@ function xlsx_sheet(array $sh): string
         . '<mergeCells count="1"><mergeCell ref="A1:' . xlsx_col(count($sh['widths']) - 1) . '1"/></mergeCells></worksheet>';
 }
 
+// ── reading: import the team's Invoice Register ──────────────────────────
+
+function import_register(string $path, int $uid): array
+{
+    $rows = read_register($path);
+    $before = fn($t) => (int) q("SELECT COUNT(*) FROM $t")->fetchColumn();
+    [$parties0, $products0] = [$before('parties'), $before('products')];
+    // invoices already in the app, so importing the same file twice adds nothing twice
+    $seen = [];
+    foreach (q('SELECT p.name, pm.invoice_no, pm.invoice_date, pm.amount FROM payments pm JOIN parties p ON p.id = pm.party_id')->fetchAll() as $e) {
+        $k = import_key($e['name'], $e['invoice_no'], $e['invoice_date'], $e['amount']);
+        $seen[$k] = ($seen[$k] ?? 0) + 1;
+    }
+    $added = $skipped = 0;
+    $errors = [];
+    db()->beginTransaction();
+    foreach ($rows as $rn => $r) {
+        $amount = import_amount($r['amount']);
+        $paid = import_amount($r['paid']) ?? '0.00';
+        $r['invoice_date'] ??= $r['due_date']; // some rows only have a due date
+        $err = match (true) {
+            $r['party'] === '' => 'party name is empty',
+            $amount !== null && paise($amount) === 0 && paise($paid) > 0 => 'invoice amount is 0 (an advance?) — add it in the app once the invoice amount is known',
+            $amount === null || paise($amount) <= 0 => 'invoice amount is empty or not a number',
+            $r['invoice_date'] === null => 'invoice date and due date are both empty',
+            paise($paid) > paise($amount) => 'amount paid is more than the invoice amount',
+            default => null,
+        };
+        if ($err) { $errors[] = "Row $rn: $err"; continue; }
+        $no = in_array($r['invoice_no'], ['', '-'], true) ? null : mb_substr(preg_replace('/^(\d+)\.0+$/', '$1', $r['invoice_no']), 0, 60); // 658.0 → 658
+        $k = import_key($r['party'], $no, $r['invoice_date'], $amount);
+        if (($seen[$k] ?? 0) > 0) { $seen[$k]--; $skipped++; continue; }
+        $product = $r['remarks'] !== '' ? product_name(mb_substr($r['remarks'], 0, 190)) : '';
+        q("INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, due_date, status, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?)",
+          [party_id(mb_substr($r['party'], 0, 190)), $no, $r['invoice_date'], $product, $no ? 'gst' : 'cash', $amount, $r['due_date'] ?? $r['invoice_date'], $uid]);
+        $pid = (int) db()->lastInsertId();
+        if (paise($paid) > 0) {
+            q("INSERT INTO payouts (payment_id, amount, paid_on, note, in_balance, created_by) VALUES (?, ?, ?, 'Paid before import (from Excel)', FALSE, ?)",
+              [$pid, $paid, $r['invoice_date'], $uid]);
+        }
+        $added++;
+    }
+    db()->commit();
+    return ['added' => $added, 'skipped' => $skipped, 'errors' => $errors,
+            'parties' => $before('parties') - $parties0, 'products' => $before('products') - $products0];
+}
+
+function import_key(string $party, ?string $no, ?string $date, $amount): string
+{
+    return mb_strtolower(trim(preg_replace('/\s+/', ' ', $party))) . '|' . ($no ?? '') . '|' . $date . '|' . paise($amount);
+}
+
+function import_amount(string $v): ?string
+{
+    $v = str_replace([',', '₹', ' '], '', $v);
+    return is_numeric($v) ? number_format((float) $v, 2, '.', '') : null;
+}
+
+// rows keyed by sheet row number: invoice_date, invoice_no, party, amount, paid, due_date, remarks
+function read_register(string $path): array
+{
+    $cells = xlsx_rows($path, 'Invoice Register');
+    $want = ['invoice_date' => 'invoice date', 'invoice_no' => 'invoice no', 'party' => 'party', 'amount' => 'invoice amount',
+             'paid' => 'amount paid', 'due_date' => 'due date', 'remarks' => 'remark'];
+    foreach ($cells as $rn => $row) {
+        $map = [];
+        foreach ($row as $ci => $v) {
+            $v = strtolower(trim($v));
+            foreach ($want as $k => $label) if (!isset($map[$k]) && str_starts_with($v, $label)) $map[$k] = $ci;
+        }
+        if (isset($map['party'], $map['amount'])) { $header = $rn; break; }
+    }
+    if (!isset($header)) fail('Could not find the heading row. The sheet needs at least "Party Name" and "Invoice Amount" columns.');
+    $out = [];
+    foreach ($cells as $rn => $row) {
+        if ($rn <= $header) continue;
+        $get = fn($k) => isset($map[$k]) ? trim(preg_replace('/\s+/', ' ', (string) ($row[$map[$k]] ?? ''))) : '';
+        if ($get('party') === '' && $get('amount') === '') continue; // empty line
+        $out[$rn] = ['invoice_date' => excel_date($get('invoice_date')), 'invoice_no' => $get('invoice_no'), 'party' => $get('party'),
+                     'amount' => $get('amount'), 'paid' => $get('paid'), 'due_date' => excel_date($get('due_date')), 'remarks' => $get('remarks')];
+    }
+    return $out;
+}
+
+// Excel stores dates as day numbers; typed text dates are read as day/month/year (Indian order)
+function excel_date(string $v): ?string
+{
+    if ($v === '') return null;
+    if (is_numeric($v)) return (float) $v > 20000 && (float) $v < 80000 ? gmdate('Y-m-d', (int) round(((float) $v - 25569) * 86400)) : null;
+    foreach (['d/m/Y', 'd-m-Y', 'd.m.Y', 'Y-m-d', 'd-M-Y', 'd M Y', 'd/m/y', 'd-M-y'] as $fmt) {
+        $d = DateTime::createFromFormat("!$fmt", $v);
+        if ($d && $d->format($fmt) === $v) return $d->format('Y-m-d');
+    }
+    return null;
+}
+
+// cell values of one sheet: [row number => [column index => text]]; formulas give their last calculated value
+function xlsx_rows(string $path, string $prefer): array
+{
+    if (!class_exists('ZipArchive')) fail('Excel import needs the PHP "zip" extension. Turn it on in hPanel → Advanced → PHP Configuration.');
+    $zip = new ZipArchive();
+    if ($zip->open($path) !== true) fail('That file is not a valid .xlsx workbook.');
+    $wb = simplexml_load_string((string) $zip->getFromName('xl/workbook.xml'));
+    $rels = simplexml_load_string((string) $zip->getFromName('xl/_rels/workbook.xml.rels'));
+    if (!$wb || !$rels) fail('That file is not a valid .xlsx workbook.');
+    $targets = [];
+    foreach ($rels->Relationship as $r) $targets[(string) $r['Id']] = (string) $r['Target'];
+    $target = null;
+    foreach ($wb->sheets->sheet as $s) {
+        $t = $targets[(string) $s->attributes('http://schemas.openxmlformats.org/officeDocument/2006/relationships')['id']] ?? null;
+        $target ??= $t;
+        if (strcasecmp(trim((string) $s['name']), $prefer) === 0) { $target = $t; break; }
+    }
+    if (!$target) fail('No sheets found in that workbook.');
+    $target = str_starts_with($target, '/') ? ltrim($target, '/') : 'xl/' . $target;
+    $text = fn(SimpleXMLElement $x) => html_entity_decode(strip_tags((string) $x->asXML()), ENT_QUOTES | ENT_XML1, 'UTF-8');
+    $shared = [];
+    if (($ss = $zip->getFromName('xl/sharedStrings.xml')) !== false) foreach (simplexml_load_string($ss)->si as $si) $shared[] = $text($si);
+    $sheet = simplexml_load_string((string) $zip->getFromName($target)) ?: fail('Could not read the sheet.');
+    $out = [];
+    foreach ($sheet->sheetData->row as $row) {
+        $cells = [];
+        foreach ($row->c as $c) {
+            preg_match('/^[A-Z]+/', (string) $c['r'], $m);
+            $col = 0;
+            foreach (str_split($m[0]) as $ch) $col = $col * 26 + ord($ch) - 64;
+            $t = (string) $c['t'];
+            $cells[$col - 1] = match ($t) { 's' => $shared[(int) $c->v] ?? '', 'inlineStr' => $text($c->is), default => (string) $c->v };
+        }
+        $out[(int) $row['r']] = $cells;
+    }
+    return $out;
+}
+
 function xlsx_col(int $i): string // 0 → A, 26 → AA
 {
     $s = '';
