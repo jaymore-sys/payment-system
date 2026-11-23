@@ -78,8 +78,8 @@ case 'home':
     $acts = can('request') ? '<a href="?p=payment" role="button">＋ New invoice</a><a href="?p=receivables#add" role="button" class="secondary">＋ Receipt</a>' : '';
     head('Dashboard', $acts); ?>
     <div class="stats">
-      <article class="stat indigo" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article>
-      <article class="stat amber" data-icon="📌"><small>Total outstanding</small><div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div></article>
+      <article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article>
+      <article class="stat" data-icon="📌"><small>Total outstanding</small><div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div></article>
       <article class="stat red" data-icon="⏰"><small>Overdue outstanding</small><div class="big neg"><a href="?p=payments&age=overdue"><?= money($t['overdue']) ?></a></div></article>
       <?php if (can('approve')): ?>
         <article class="stat green" data-icon="✅"><small>Waiting for your approval</small><div class="big"><a href="?p=approvals"><?= $mine ?></a></div></article>
@@ -139,7 +139,7 @@ case 'approvals':
         go($from_invoice ? "?p=payment&id=$id" : '?p=approvals', $a === 'approve' ? 'Approved' : 'Rejected');
     }
     $base = 'SELECT r.*, u.name AS by_name, v.name AS approver FROM requests r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.approver_id';
-    $link = fn($r) => ['invoice' => "?p=payment&id={$r['id']}", 'receipt' => '?p=receivables', 'balance' => '?p=cash'][$r['type']];
+    $link = fn($r) => $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables';
     if (can('approve')) {
         $rows = q("$base WHERE r.status = 'pending' AND (r.approver_id = ? OR r.approver_id IS NULL) ORDER BY r.created_at", [me()['id']])->fetchAll();
         $title = 'Waiting for your approval';
@@ -154,7 +154,7 @@ case 'approvals':
     if (!$rows): ?><div class="panel empty">Nothing here right now. 🎉</div><?php else: ?>
     <div class="tbl"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><th></th></tr></thead><tbody>
     <?php foreach ($rows as $r): ?>
-      <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] === 'balance' ? 'balance change' : $r['type'] ?></span></td>
+      <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
         <td class="wrap"><a href="<?= $link($r) ?>"><?= h($r['detail']) ?></a><?= $r['status'] === 'rejected' ? '<br><small class="neg">Reason: ' . h($r['reject_reason']) . '</small>' : '' ?></td>
         <td class="right <?= $r['amount'] < 0 ? 'neg' : '' ?>"><strong><?= money($r['amount']) ?></strong></td>
         <td><?= h($r['by_name']) ?><br><small><?= $date($r['created_at']) ?></small></td><td><?= h($r['approver'] ?? 'any admin') ?></td>
@@ -326,9 +326,9 @@ case 'payment':
         <small>Added by <?= h($pm['creator']) ?> on <?= $date($pm['created_at']) ?>
           <?= $pm['approver'] ? ' · 📨 request sent to <strong>' . h($pm['approver']) . '</strong>' : '' ?><?= $pm['reviewer'] ? ' · reviewed by ' . h($pm['reviewer']) : '' ?></small></p>
       <div class="stats">
-        <article class="stat violet" data-icon="🧾"><small>Invoice amount</small><div class="big"><?= money($pm['amount']) ?></div></article>
+        <article class="stat" data-icon="🧾"><small>Invoice amount</small><div class="big"><?= money($pm['amount']) ?></div></article>
         <article class="stat green" data-icon="💸"><small>Paid</small><div class="big pos"><?= money($pm['paid']) ?></div></article>
-        <article class="stat amber" data-icon="📌"><small>Outstanding</small><div class="big <?= $pm['outstanding'] > 0 ? 'neg' : '' ?>"><?= money($pm['outstanding']) ?></div></article>
+        <article class="stat" data-icon="📌"><small>Outstanding</small><div class="big <?= $pm['outstanding'] > 0 ? 'neg' : '' ?>"><?= money($pm['outstanding']) ?></div></article>
         <article class="stat <?= $pm['days_overdue'] > 0 ? 'red' : 'blue' ?>" data-icon="📅"><small>Due date</small><div class="big"><?= $date($pm['due_date']) ?></div>
           <?php if ($pm['days_overdue'] > 0): ?><small class="neg"><?= (int) $pm['days_overdue'] ?> days overdue</small><?php endif ?></article>
       </div>
@@ -526,52 +526,46 @@ case 'receivables':
     <tfoot><tr><th colspan="4"><?= count($rows) ?> receipts · total of approved</th><th class="right"><?= money(array_sum(array_map(fn($r) => paise($r['amount']), $approved)) / 100) ?></th><th colspan="3"></th></tr></tfoot></table></div>
     <?php foot();
 
-// ── balance: admin adds directly, administrator sends a request ──────────
+// ── balance: admin and administrator add entries directly (no approval) ─
 case 'cash':
     need('see_cash');
     if ($post) {
+        need('balance');
         if ($a === 'delete') {
-            need('manage');
             q('DELETE FROM cash_entries WHERE id = ?', [(int) ($_POST['id'] ?? 0)]);
             go('?p=cash', 'Entry deleted');
         }
-        if (!can('manage') && !can('request')) fail('Your role does not allow this.', 403);
         $kind = enum_in($_POST['kind'] ?? '', ['opening', 'adjustment', 'expense']);
         $amt = amount_in($_POST['amount'] ?? '', true);
         if ($kind === 'expense') $amt = '-' . ltrim($amt, '-');
-        $direct = can('manage'); // admin's own entries count at once
-        q('INSERT INTO cash_entries (entry_date, amount, kind, note, status, approver_id, reviewed_by, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [date_in($_POST['entry_date'] ?? ''), $amt, $kind, trim($_POST['note'] ?? '') ?: null,
-           $direct ? 'approved' : 'pending', $direct ? null : approver_in(), $direct ? me()['id'] : null, me()['id']]);
-        go('?p=cash', $direct ? 'Entry added' : 'Balance change sent for approval');
+        q("INSERT INTO cash_entries (entry_date, amount, kind, note, status, reviewed_by, created_by) VALUES (?, ?, ?, ?, 'approved', ?, ?)",
+          [date_in($_POST['entry_date'] ?? ''), $amt, $kind, trim($_POST['note'] ?? '') ?: null, me()['id'], me()['id']]);
+        go('?p=cash', 'Balance updated');
     }
-    $rows = q('SELECT c.*, u.name, a.name AS approver FROM cash_entries c JOIN users u ON u.id = c.created_by LEFT JOIN users a ON a.id = c.approver_id
-               ORDER BY c.entry_date DESC, c.id DESC')->fetchAll();
+    $rows = q('SELECT c.*, u.name FROM cash_entries c JOIN users u ON u.id = c.created_by ORDER BY c.entry_date DESC, c.id DESC')->fetchAll();
     $bal = q('SELECT balance FROM current_balance')->fetchColumn();
     head('Balance'); ?>
-    <div class="stats"><article class="stat indigo" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article></div>
-    <p class="note">Approved receipts add to the balance and recorded payments take away from it automatically. Use this page for the opening balance, corrections and other costs.</p>
-    <?php if (can('manage') || can('request')): ?>
+    <div class="stats"><article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article></div>
+    <p class="note">Approved receipts add to the balance and recorded payments take away from it automatically. Use this page for the opening balance, corrections and other costs — they count straight away.</p>
+    <?php if (can('balance')): ?>
     <form method="post" class="panel"><?= csrf_field() ?>
-      <strong><?= can('manage') ? '＋ Add balance entry' : '📨 Request a balance change' ?></strong><br><br>
+      <strong>＋ Add balance entry</strong><br><br>
       <div class="grid">
         <label>Type<select name="kind"><option value="expense">Expense / other cost (−)</option><option value="adjustment">Correction (+ or −)</option><option value="opening">Opening balance</option></select></label>
-        <label>Amount (₹)<input name="amount" inputmode="decimal" placeholder="Expense: enter positive" required></label>
+        <label>Amount (₹)<input name="amount" inputmode="decimal" placeholder="e.g. 2500  (correction: −2500 to reduce)" required></label>
         <label>Date<input type="date" name="entry_date" value="<?= date('Y-m-d') ?>" required></label>
       </div>
-      <div class="grid"><label>Note<input name="note" placeholder="e.g. office rent, bank charges"></label><?= can('manage') ? '' : approver_select() ?></div>
-      <button><?= can('manage') ? 'Add entry' : '📨 Send for approval' ?></button>
+      <label>Note<input name="note" placeholder="e.g. office rent, bank charges"></label>
+      <button>Add entry</button>
     </form>
     <?php endif ?>
-    <div class="tbl"><table><thead><tr><th>Date</th><th>Type</th><th class="right">Amount</th><th>Note</th><th>By</th><th>Approval</th><?= can('manage') ? '<th></th>' : '' ?></tr></thead><tbody>
-    <?php foreach ($rows as $r): ?>
+    <div class="tbl"><table><thead><tr><th>Date</th><th>Type</th><th class="right">Amount</th><th>Note</th><th>By</th><?= can('balance') ? '<th></th>' : '' ?></tr></thead><tbody>
+    <?php foreach ($rows as $r): if ($r['status'] === 'rejected') continue; ?>
       <tr><td><?= $date($r['entry_date']) ?></td><td><?= h(ucfirst($r['kind'])) ?></td>
         <td class="right <?= $r['amount'] < 0 ? 'neg' : 'pos' ?>"><strong><?= money($r['amount']) ?></strong></td><td><?= h($r['note']) ?></td><td><?= h($r['name']) ?></td>
-        <td><?= badge($r['status']) ?><?= $r['status'] === 'pending' && $r['approver'] ? ' <small>→ ' . h($r['approver']) . '</small>' : '' ?>
-          <?= $r['status'] === 'rejected' ? '<br><small class="neg">' . h($r['reject_reason']) . '</small>' : '' ?></td>
-        <?php if (can('manage')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this entry?')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
+        <?php if (can('balance')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this entry? The balance changes back.')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
     <?php endforeach;
-    if (!$rows): ?><tr><td colspan="7" class="empty">No entries yet. Start with the opening balance.</td></tr><?php endif ?></tbody></table></div>
+    if (!$rows): ?><tr><td colspan="6" class="empty">No entries yet. Start with the opening balance.</td></tr><?php endif ?></tbody></table></div>
     <?php foot();
 
 // ── statement: every money movement with running balance ─────────────────
@@ -595,7 +589,7 @@ case 'statement':
       <article class="stat blue" data-icon="📂"><small>Opening</small><div class="big"><?= money($open) ?></div></article>
       <article class="stat green" data-icon="⬇️"><small>Money in</small><div class="big pos"><?= money($in) ?></div></article>
       <article class="stat red" data-icon="⬆️"><small>Money out</small><div class="big neg"><?= money($out) ?></div></article>
-      <article class="stat indigo" data-icon="🏦"><small>Closing</small><div class="big"><?= money($rows ? end($rows)['balance'] : $open) ?></div></article>
+      <article class="stat" data-icon="🏦"><small>Closing</small><div class="big"><?= money($rows ? end($rows)['balance'] : $open) ?></div></article>
     </div>
     <div class="tbl"><table><thead><tr><th>Date</th><th>Type</th><th>Detail</th><th class="right">Amount</th><th class="right">Balance</th></tr></thead><tbody>
     <?php foreach ($rows as $r): ?>

@@ -54,6 +54,16 @@ function db(): PDO
         }
         foreach (schema_statements() as $s) if (stripos($s, 'CREATE OR REPLACE VIEW') === 0) $db->exec($s);
     }
+    // one-off name lists dropped on the server (kept out of the public repo): add them to the dropdowns, then delete the file
+    $seed = __DIR__ . '/seed-names.php';
+    if (is_file($seed)) {
+        $names = require $seed;
+        foreach (['parties' => $names['parties'] ?? [], 'products' => $names['products'] ?? []] as $table => $list) {
+            $st = $db->prepare("INSERT IGNORE INTO $table (name) VALUES (?)");
+            foreach ($list as $n) if (($n = trim(preg_replace('/\s+/', ' ', (string) $n))) !== '') $st->execute([mb_substr($n, 0, 190)]);
+        }
+        @unlink($seed);
+    }
     return $db;
 }
 
@@ -101,6 +111,10 @@ const MIGRATIONS = [
            ADD CONSTRAINT cash_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> '')",
         "UPDATE cash_entries SET status = 'approved'",
     ],
+    5 => [ // balance entries no longer need approval: administrator and admin add them directly
+        "UPDATE cash_entries SET status = 'approved' WHERE status = 'pending'",
+        "ALTER TABLE cash_entries ALTER status SET DEFAULT 'approved'",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -132,7 +146,8 @@ const PERMS = [
     'pay'        => ['admin', 'administrator'],
     'files'      => ['admin', 'administrator'],
     'chat'       => ['superadmin', 'admin', 'administrator'],
-    'manage'     => ['admin'],                                // direct balance entries, remove payments, deletes
+    'manage'     => ['admin'],                                // remove payments, delete invoices/receipts
+    'balance'    => ['admin', 'administrator'],               // add / delete balance entries directly, no approval
     'see_cash'   => ['superadmin', 'admin', 'administrator'],
     'import'     => ['admin', 'administrator'],
     'users'      => ['developer'],
@@ -278,7 +293,7 @@ function approver_in(): int
     $id = (int) ($_POST['approver'] ?? 0);
     return q("SELECT 1 FROM users WHERE id = ? AND role = 'admin'", [$id])->fetch() ? $id : fail('Choose which admin to send the request to');
 }
-const REVIEWABLE = ['invoice' => 'payments', 'receipt' => 'receivables', 'balance' => 'cash_entries'];
+const REVIEWABLE = ['invoice' => 'payments', 'receipt' => 'receivables'];
 function review(string $type, int $id, bool $approve, string $reason = ''): void
 {
     need('approve');
@@ -338,17 +353,18 @@ function head(string $title, string $actions = ''): void
     $count = $u ? pending_for_me() : 0; ?>
 <!doctype html>
 <html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title><?= h($title) ?> · Payment Desk</title>
+<title><?= h($title) ?> · Valencia Payment Desk</title>
+<link rel="icon" href="vnl-logo.webp">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=6">
+<link rel="stylesheet" href="style.css?v=8">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
 <input type="checkbox" id="nav-toggle" hidden>
 <aside class="side">
-  <a class="brand" href="?"><span class="logo">₹</span><span>Payment Desk</span></a>
+  <a class="brand" href="?"><img src="vnl-logo.webp" alt="Valencia Nutrition"><small>Payment Desk</small></a>
   <nav>
   <?php foreach ($nav as [$p, $icon, $label, $perm]): if (!can($perm)) continue; ?>
     <a href="?p=<?= $p ?>" class="<?= $p === $cur ? 'active' : '' ?>"><span class="ico"><?= $icon ?></span><?= $label ?>
@@ -357,14 +373,15 @@ function head(string $title, string $actions = ''): void
   </nav>
   <div class="me"><span class="avatar"><?= h(mb_strtoupper(mb_substr($u['name'], 0, 1))) ?></span>
     <div><strong><?= h($u['name']) ?></strong><small><?= h(ucfirst($u['role'])) ?></small></div>
-    <a href="?p=logout" title="Log out">⏻</a></div>
+  </div>
+  <a class="logout" href="?p=logout">⏻ Logout</a>
 </aside>
-<header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><span class="logo">₹</span><strong>Payment Desk</strong>
+<header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><img src="vnl-logo.webp" alt="Valencia Nutrition"><strong>Payment Desk</strong>
   <?php if ($count): ?><a class="count" href="?p=approvals"><?= $count ?></a><?php endif ?></header>
 <label for="nav-toggle" class="scrim"></label>
 <main class="content">
 <?php else: ?>
-<main class="auth-box"><div class="brand"><span class="logo">₹</span><span>Payment Desk</span></div>
+<main class="auth-box"><div class="brand"><img src="vnl-logo.webp" alt="Valencia Nutrition"><small>Payment Desk</small></div>
 <?php endif ?>
 <?php if ($flash): ?><div class="flash">✅ <?= h($flash) ?></div><?php endif ?>
 <div class="page-head"><h1><?= h($title) ?></h1><?php if ($actions): ?><div class="actions"><?= $actions ?></div><?php endif ?></div>

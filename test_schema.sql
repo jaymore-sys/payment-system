@@ -27,11 +27,11 @@ DO IF((SELECT balance FROM current_balance) = 84999.50, 0, (SELECT 1 UNION SELEC
 DO IF((SELECT COUNT(*) FROM upcoming_dues) = 0, 0, (SELECT 1 UNION SELECT 2));                        -- paid leaves reminders
 
 INSERT INTO cash_entries (entry_date, amount, kind, status, created_by) VALUES (CURDATE(), -4999.50, 'expense', 'approved', 1);
-INSERT INTO cash_entries (entry_date, amount, kind, created_by) VALUES (CURDATE(), -1, 'expense', 2);                       -- pending: not counted
+INSERT INTO cash_entries (entry_date, amount, kind, status, created_by) VALUES (CURDATE(), -1, 'expense', 'pending', 2); -- old pending request: not counted
 DO IF((SELECT balance FROM current_balance) = 80000, 0, (SELECT 1 UNION SELECT 2));                   -- expense subtracts
 DO IF((SELECT COUNT(*) FROM statement) = 5, 0, (SELECT 1 UNION SELECT 2));
 INSERT INTO payouts (payment_id, amount, paid_on, in_balance, created_by) VALUES (1, 1, CURDATE(), FALSE, 2);              -- paid before import: not in balance
 DO IF((SELECT balance FROM current_balance) = 80000, 0, (SELECT 1 UNION SELECT 2));
-DO IF((SELECT COUNT(*) FROM requests WHERE status = 'pending') = 2, 0, (SELECT 1 UNION SELECT 2));
+DO IF((SELECT COUNT(*) FROM requests WHERE status = 'pending') = 1, 0, (SELECT 1 UNION SELECT 2));
 
 SELECT 'ALL CHECKS PASSED';

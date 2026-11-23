@@ -9,7 +9,7 @@
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   Invoices, receipts and balance changes are requests sent to one admin; only approved ones count.
+--   Invoices and receipts are requests sent to one admin; only approved ones count. Balance entries need no approval.
 
 SET NAMES utf8mb4;
 
@@ -17,7 +17,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '4');
+INSERT INTO app_meta VALUES ('schema', '5');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -106,14 +106,14 @@ CREATE TABLE receivables (
   INDEX (received_on)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- opening balance, corrections (+/−), other costs (−); admin adds directly, administrator sends a request
+-- opening balance, corrections (+/−), other costs (−); admin and administrator add them directly (status kept for old requests)
 CREATE TABLE cash_entries (
   id         INT AUTO_INCREMENT PRIMARY KEY,
   entry_date DATE NOT NULL,
   amount     DECIMAL(14,2) NOT NULL,             -- + money in, − money out
   kind       ENUM('opening','adjustment','expense') NOT NULL,
   note       TEXT,
-  status     ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  status     ENUM('pending','approved','rejected') NOT NULL DEFAULT 'approved',
   approver_id INT,
   reject_reason TEXT,
   reviewed_by INT,
@@ -188,11 +188,7 @@ CREATE OR REPLACE VIEW requests AS
   UNION ALL
   SELECT 'receipt', r.id, CONCAT(p.name, ' · against ', r.against, IF(COALESCE(r.note, '') <> '', CONCAT(' · ', r.note), '')),
          r.amount, r.status, r.approver_id, r.reject_reason, r.created_by, r.created_at
-    FROM receivables r JOIN parties p ON p.id = r.party_id
-  UNION ALL
-  SELECT 'balance', c.id, CONCAT(c.kind, IF(COALESCE(c.note, '') <> '', CONCAT(' · ', c.note), '')),
-         c.amount, c.status, c.approver_id, c.reject_reason, c.created_by, c.created_at
-    FROM cash_entries c;
+    FROM receivables r JOIN parties p ON p.id = r.party_id;
 
 CREATE OR REPLACE VIEW current_balance AS
   SELECT COALESCE(SUM(amount), 0) AS balance FROM statement;
