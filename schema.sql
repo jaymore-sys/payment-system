@@ -1,17 +1,23 @@
 -- Payment records app — MySQL / MariaDB (Hostinger).
--- Import once: hPanel → Databases → phpMyAdmin → select your database → Import → this file.
+-- The app runs this file itself on first start (empty database); later changes go in MIGRATIONS in app.php.
 --
 -- Current balance is never stored; it is calculated (view current_balance) from:
 --   cash_entries (admin: opening balance, adjustments, expenses)
---   + receivables  − payments with status 'paid'
+--   + receivables  − payouts (each payment made against an invoice)
 -- so it cannot drift from the records.
 --
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   A payment must be 'approved' before 'paid'.
+--   An invoice must be 'approved' before payouts are recorded against it.
 
 SET NAMES utf8mb4;
+
+CREATE TABLE app_meta (
+  k VARCHAR(30) PRIMARY KEY,
+  v VARCHAR(100) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+INSERT INTO app_meta VALUES ('schema', '3');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -30,17 +36,19 @@ CREATE TABLE parties (
   created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- inward invoices to pay (the "Invoice Register")
 CREATE TABLE payments (
   id            INT AUTO_INCREMENT PRIMARY KEY,
   party_id      INT NOT NULL,
-  products      TEXT NOT NULL,
+  invoice_no    VARCHAR(60),
+  invoice_date  DATE,
+  products      TEXT NOT NULL,                   -- products / remarks
   bill_type     ENUM('gst','cash') NOT NULL,
-  amount        DECIMAL(14,2) NOT NULL,
+  amount        DECIMAL(14,2) NOT NULL,          -- invoice amount
   due_date      DATE NOT NULL,
-  status        ENUM('pending','approved','rejected','paid') NOT NULL DEFAULT 'pending',
+  status        ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
   reject_reason TEXT,
   reviewed_by   INT,
-  paid_on       DATE,
   created_by    INT NOT NULL,
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (party_id)    REFERENCES parties(id),
@@ -48,8 +56,22 @@ CREATE TABLE payments (
   FOREIGN KEY (created_by)  REFERENCES users(id),
   CONSTRAINT amount_positive   CHECK (amount > 0),
   CONSTRAINT reject_has_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> ''),
-  CONSTRAINT paid_has_date     CHECK (status <> 'paid' OR paid_on IS NOT NULL),
   INDEX (status, due_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- money paid against an invoice; several = part payments
+CREATE TABLE payouts (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  payment_id INT NOT NULL,
+  amount     DECIMAL(14,2) NOT NULL,
+  paid_on    DATE NOT NULL,
+  note       VARCHAR(255),
+  created_by INT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT payout_positive CHECK (amount > 0),
+  INDEX (paid_on)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE receivables (
@@ -106,24 +128,40 @@ CREATE TABLE attachments (
   FOREIGN KEY (uploaded_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ── views (re-created by the app after every migration) ──────────────────
+
+-- one row per invoice with the same derived columns as the Excel register
+CREATE OR REPLACE VIEW payment_register AS
+  SELECT pm.*, p.name AS party,
+         COALESCE(po.paid, 0) AS paid,
+         pm.amount - COALESCE(po.paid, 0) AS outstanding,
+         po.last_paid_on,
+         CASE WHEN COALESCE(po.paid, 0) >= pm.amount THEN 'Paid'
+              WHEN COALESCE(po.paid, 0) > 0 THEN 'Part Paid' ELSE 'Unpaid' END AS pay_status,
+         IF(pm.amount > COALESCE(po.paid, 0), GREATEST(0, DATEDIFF(CURDATE(), pm.due_date)), 0) AS days_overdue,
+         DATEDIFF(CURDATE(), COALESCE(pm.invoice_date, DATE(pm.created_at))) AS days_since_invoice
+    FROM payments pm
+    JOIN parties p ON p.id = pm.party_id
+    LEFT JOIN (SELECT payment_id, SUM(amount) AS paid, MAX(paid_on) AS last_paid_on FROM payouts GROUP BY payment_id) po
+      ON po.payment_id = pm.id;
+
 -- every money movement in one list (reports: filter on entry_date)
-CREATE VIEW statement AS
-  SELECT c.entry_date, c.amount, c.kind, c.note AS detail, c.id AS ref_id
+CREATE OR REPLACE VIEW statement AS
+  SELECT c.entry_date, c.amount, c.kind, c.note AS detail, c.id AS ref_id, c.id AS row_id
     FROM cash_entries c
   UNION ALL
-  SELECT r.received_on, r.amount, 'receipt', CONCAT(p.name, ' (', r.against, ')'), r.id
+  SELECT r.received_on, r.amount, 'receipt', CONCAT(p.name, ' (', r.against, ')'), r.id, r.id
     FROM receivables r JOIN parties p ON p.id = r.party_id
   UNION ALL
-  SELECT pm.paid_on, -pm.amount, 'payment', CONCAT(p.name, ': ', pm.products), pm.id
-    FROM payments pm JOIN parties p ON p.id = pm.party_id
-   WHERE pm.status = 'paid';
+  SELECT po.paid_on, -po.amount, 'payment', CONCAT(p.name, ': ', COALESCE(NULLIF(pm.invoice_no, ''), pm.products)), pm.id, po.id
+    FROM payouts po JOIN payments pm ON pm.id = po.payment_id JOIN parties p ON p.id = pm.party_id;
 
-CREATE VIEW current_balance AS
+CREATE OR REPLACE VIEW current_balance AS
   SELECT COALESCE(SUM(amount), 0) AS balance FROM statement;
 
--- reminder popup: unpaid payments overdue or due within 7 days
-CREATE VIEW upcoming_dues AS
-  SELECT pm.*, p.name AS party_name, DATEDIFF(pm.due_date, CURDATE()) AS days_left
-    FROM payments pm JOIN parties p ON p.id = pm.party_id
-   WHERE pm.status IN ('pending','approved')
-     AND pm.due_date <= CURDATE() + INTERVAL 7 DAY;
+-- reminder popup: invoices with money still owed, overdue or due within 7 days
+CREATE OR REPLACE VIEW upcoming_dues AS
+  SELECT r.*, DATEDIFF(r.due_date, CURDATE()) AS days_left
+    FROM payment_register r
+   WHERE r.status IN ('pending','approved') AND r.outstanding > 0
+     AND r.due_date <= CURDATE() + INTERVAL 7 DAY;

@@ -11,7 +11,10 @@ set_exception_handler(function (Throwable $e) {
 date_default_timezone_set('Asia/Kolkata');
 session_start(['cookie_httponly' => true, 'cookie_samesite' => 'Lax', 'cookie_secure' => !empty($_SERVER['HTTPS'])]);
 
-const STATUSES   = ['pending', 'approved', 'rejected', 'paid'];
+const STATUSES   = ['pending', 'approved', 'rejected'];             // approval
+const PAY_STATES = ['Unpaid', 'Part Paid', 'Paid'];                  // from payouts
+const AGEING     = ['not_due' => 'Not Yet Due', 'd1_30' => '1–30 Days Overdue', 'd31_60' => '31–60 Days Overdue',
+                    'd61_90' => '61–90 Days Overdue', 'd90' => 'Over 90 Days Overdue'];
 const FILE_TYPES = ['pdf' => 'application/pdf', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png',
                     'webp' => 'image/webp', 'xls' => 'application/vnd.ms-excel',
                     'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
@@ -36,19 +39,51 @@ function db(): PDO
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     ]);
     $db->exec("SET time_zone = '+05:30'");
-    // first run: create the tables
+    // first run: create everything from schema.sql
     if (!$db->query("SHOW TABLES LIKE 'users'")->fetch()) {
-        $sql = preg_replace('/--.*$/m', '', file_get_contents(__DIR__ . '/schema.sql'));
-        foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt) $db->exec($stmt);
+        foreach (schema_statements() as $stmt) $db->exec($stmt);
+        return $db;
     }
-    // ponytail: inline migration from the first release's admin/staff roles; move to versioned migrations if more pile up
-    if (str_contains($db->query("SHOW COLUMNS FROM users LIKE 'role'")->fetch()['Type'], "'staff'")) {
-        $db->exec("ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer','staff') NOT NULL DEFAULT 'administrator'");
-        $db->exec("UPDATE users SET role = 'administrator' WHERE role = 'staff'");
-        $db->exec("ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator'");
+    // existing database: apply migrations newer than its version, then rebuild the views
+    $ver = $db->query("SHOW TABLES LIKE 'app_meta'")->fetch() ? (int) $db->query("SELECT v FROM app_meta WHERE k = 'schema'")->fetchColumn() : 1;
+    if ($ver < max(array_keys(MIGRATIONS))) {
+        foreach (MIGRATIONS as $n => $stmts) {
+            if ($n <= $ver) continue;
+            foreach ($stmts as $s) $db->exec($s);
+            $db->exec("REPLACE INTO app_meta VALUES ('schema', '$n')");
+        }
+        foreach (schema_statements() as $s) if (stripos($s, 'CREATE OR REPLACE VIEW') === 0) $db->exec($s);
     }
     return $db;
 }
+
+function schema_statements(): array
+{
+    $sql = preg_replace('/--.*$/m', '', file_get_contents(__DIR__ . '/schema.sql'));
+    return array_values(array_filter(array_map('trim', explode(';', $sql))));
+}
+
+// Changes for databases created by older versions. schema.sql already holds the result for new installs.
+const MIGRATIONS = [
+    2 => [ // roles: admin/staff → superadmin/admin/administrator/developer
+        "CREATE TABLE IF NOT EXISTS app_meta (k VARCHAR(30) PRIMARY KEY, v VARCHAR(100) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer','staff') NOT NULL DEFAULT 'administrator'",
+        "UPDATE users SET role = 'administrator' WHERE role = 'staff'",
+        "ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator'",
+    ],
+    3 => [ // invoice no/date + part payments (payouts) replace the single 'paid' status
+        "DROP VIEW IF EXISTS upcoming_dues, current_balance, statement",
+        "ALTER TABLE payments ADD COLUMN invoice_no VARCHAR(60) AFTER party_id, ADD COLUMN invoice_date DATE AFTER invoice_no",
+        "CREATE TABLE payouts (id INT AUTO_INCREMENT PRIMARY KEY, payment_id INT NOT NULL, amount DECIMAL(14,2) NOT NULL, paid_on DATE NOT NULL,
+           note VARCHAR(255), created_by INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE CASCADE, FOREIGN KEY (created_by) REFERENCES users(id),
+           CONSTRAINT payout_positive CHECK (amount > 0), INDEX (paid_on)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "INSERT INTO payouts (payment_id, amount, paid_on, note, created_by) SELECT id, amount, paid_on, 'Paid in full', created_by FROM payments WHERE status = 'paid'",
+        "ALTER TABLE payments DROP CONSTRAINT paid_has_date",
+        "UPDATE payments SET status = 'approved' WHERE status = 'paid'",
+        "ALTER TABLE payments MODIFY status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending', DROP COLUMN paid_on",
+    ],
+];
 
 function q(string $sql, array $args = []): PDOStatement
 {
@@ -153,7 +188,39 @@ function money(mixed $n): string // Indian grouping: ₹12,34,567.00
     if (strlen($i) > 3) $i = preg_replace('/\B(?=(\d{2})+(?!\d))/', ',', substr($i, 0, -3)) . ',' . substr($i, -3);
     return ((float) $n < 0 ? '-' : '') . '₹' . $i . '.' . $d;
 }
-function badge(string $status): string { return '<span class="badge ' . h($status) . '">' . h($status) . '</span>'; }
+function badge(string $status): string
+{
+    $cls = ['Paid' => 'paid', 'Part Paid' => 'part', 'Unpaid' => 'unpaid'][$status] ?? $status;
+    return '<span class="badge ' . h($cls) . '">' . h($status) . '</span>';
+}
+function paise(mixed $n): int { return (int) round((float) $n * 100); } // money math in whole paise, no float drift
+
+// Totals + ageing + party-wise outstanding, same rules as the Excel tracker (rejected invoices left out).
+function summarize(array $rows): array
+{
+    $t = array_fill_keys(['invoiced', 'paid', 'outstanding', 'overdue', ...array_keys(AGEING)], 0) + ['with_balance' => 0, 'fully_paid' => 0];
+    $parties = [];
+    foreach ($rows as $r) {
+        if ($r['status'] === 'rejected') continue;
+        [$amt, $paid, $out, $od] = [paise($r['amount']), paise($r['paid']), paise($r['outstanding']), (int) $r['days_overdue']];
+        $bucket = $od === 0 ? 'not_due' : ($od <= 30 ? 'd1_30' : ($od <= 60 ? 'd31_60' : ($od <= 90 ? 'd61_90' : 'd90')));
+        $t['invoiced'] += $amt; $t['paid'] += $paid; $t['outstanding'] += $out; $t[$bucket] += $out;
+        if ($od > 0) $t['overdue'] += $out;
+        $t['with_balance'] += (int) ($out > 0);
+        $t['fully_paid'] += (int) ($r['pay_status'] === 'Paid');
+        $p = &$parties[$r['party']];
+        $p ??= ['invoices' => 0, 'invoiced' => 0, 'paid' => 0, 'outstanding' => 0, 'overdue' => 0, 'oldest' => 0];
+        $p['invoices']++; $p['invoiced'] += $amt; $p['paid'] += $paid; $p['outstanding'] += $out;
+        if ($od > 0) $p['overdue'] += $out;
+        $p['oldest'] = max($p['oldest'], $od);
+        unset($p);
+    }
+    foreach ($t as $k => $v) if (!in_array($k, ['with_balance', 'fully_paid'], true)) $t[$k] = $v / 100;
+    foreach ($parties as &$p) foreach (['invoiced', 'paid', 'outstanding', 'overdue'] as $k) $p[$k] /= 100;
+    unset($p);
+    uasort($parties, fn($a, $b) => $b['outstanding'] <=> $a['outstanding']);
+    return [$t, $parties];
+}
 function parties_datalist(): string
 {
     $o = '';
@@ -190,7 +257,7 @@ function head(string $title): void
 <style>
 nav ul{flex-wrap:wrap}
 .badge{padding:.1rem .55rem;border-radius:1rem;font-size:.8rem;color:#111;white-space:nowrap}
-.pending{background:#fde68a}.approved{background:#bfdbfe}.rejected{background:#fecaca}.paid{background:#bbf7d0}
+.pending{background:#fde68a}.approved{background:#bfdbfe}.rejected{background:#fecaca}.paid{background:#bbf7d0}.part{background:#fed7aa}.unpaid{background:#e5e7eb}
 .neg{color:#dc2626}.pos{color:#16a34a}.right{text-align:right}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
 .cards article{margin:0}.big{font-size:clamp(1.3rem,2.4vw,1.8rem);font-weight:700;white-space:nowrap}
@@ -201,12 +268,13 @@ nav li{padding-block:.3rem}td:first-child{white-space:nowrap}
 .flash{background:#bbf7d0;color:#111;padding:.5rem 1rem;border-radius:.5rem}
 form.inline{display:inline}form.inline button{padding:.2rem .6rem;margin:0;width:auto}
 td form{margin:0}
+table.striped td,table.striped th{white-space:nowrap}details{margin-top:1rem}
 </style></head>
 <body><header class="container"><nav>
 <ul><li><strong>💰 Payments</strong></li></ul>
 <?php if ($u): ?><ul>
 <?php if (can('view')): ?>
-<li><a href="?">Dashboard</a></li><li><a href="?p=payments">Payments</a></li><li><a href="?p=receivables">Receivables</a></li>
+<li><a href="?">Dashboard</a></li><li><a href="?p=payments">Invoices</a></li><li><a href="?p=outstanding">Outstanding</a></li><li><a href="?p=receivables">Receivables</a></li>
 <li><a href="?p=statement">Statement</a></li><li><a href="?p=chat">Chat</a></li>
 <?php endif ?>
 <?php if (can('see_cash')): ?><li><a href="?p=cash">Balance entries</a></li><?php endif ?>
