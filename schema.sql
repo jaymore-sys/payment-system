@@ -17,7 +17,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '5');
+INSERT INTO app_meta VALUES ('schema', '6');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -182,11 +182,12 @@ CREATE OR REPLACE VIEW statement AS
 
 -- everything that needs an admin's yes/no, in one list (Approvals page)
 CREATE OR REPLACE VIEW requests AS
-  SELECT 'invoice' AS type, pm.id, CONCAT(p.name, IF(COALESCE(pm.invoice_no, '') <> '', CONCAT(' · ', pm.invoice_no), ''), ' · ', pm.products) AS detail,
+  SELECT 'invoice' AS type, pm.id, p.name AS party, COALESCE(NULLIF(pm.invoice_no, ''), CONCAT('#', pm.id)) AS ref,
+         pm.products AS item, pm.bill_type, pm.due_date, (SELECT COUNT(*) FROM attachments a WHERE a.payment_id = pm.id) AS files,
          pm.amount, pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
     FROM payments pm JOIN parties p ON p.id = pm.party_id
   UNION ALL
-  SELECT 'receipt', r.id, CONCAT(p.name, ' · against ', r.against, IF(COALESCE(r.note, '') <> '', CONCAT(' · ', r.note), '')),
+  SELECT 'receipt', r.id, p.name, CONCAT('Against ', r.against), COALESCE(r.note, ''), NULL, NULL, 0,
          r.amount, r.status, r.approver_id, r.reject_reason, r.created_by, r.created_at
     FROM receivables r JOIN parties p ON p.id = r.party_id;
 

@@ -115,6 +115,7 @@ const MIGRATIONS = [
         "UPDATE cash_entries SET status = 'approved' WHERE status = 'pending'",
         "ALTER TABLE cash_entries ALTER status SET DEFAULT 'approved'",
     ],
+    6 => [], // requests view gained party / ref / due date / file count columns (views are rebuilt after any migration)
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -326,25 +327,45 @@ function requests_for_me(): array
 {
     return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND " . str_replace('approver_id', 'r.approver_id', MINE_SQL) . " ORDER BY r.created_at", [me()['id']])->fetchAll();
 }
-function requests_table(array $rows, callable $date): void
+// one card per request: who / what / how much on the left, amount + decision on the right
+function requests_list(array $rows, callable $date): void
 { ?>
-    <div class="tbl"><table><thead><tr><th>Type</th><th>Details</th><th class="right">Amount</th><th>Requested by</th><th>Sent to</th><th>Status</th><?= can('approve') ? '<th>Your decision</th>' : '' ?></tr></thead><tbody>
-    <?php foreach ($rows as $r): ?>
-      <tr><td><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
-        <td class="wrap"><a href="<?= $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables' ?>"><?= h($r['detail']) ?></a>
-          <?= $r['status'] === 'rejected' ? '<div class="sub neg">Reason: ' . h($r['reject_reason']) . '</div>' : '' ?></td>
-        <td class="right"><strong><?= money($r['amount']) ?></strong></td>
-        <td data-label="Requested by"><?= h($r['by_name']) ?><div class="sub"><?= $date($r['created_at']) ?></div></td><td data-label="Sent to"><?= h($r['approver'] ?? 'any admin') ?></td>
-        <td><?= badge($r['status']) ?></td>
-        <?php if (can('approve')): ?><td><?= review_buttons($r['type'], (int) $r['id'], $r['status']) ?></td><?php endif ?></tr>
-    <?php endforeach ?></tbody></table></div>
+    <div class="reqs">
+    <?php foreach ($rows as $r):
+        $link = $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables';
+        $days = $r['due_date'] ? (int) round((strtotime($r['due_date']) - strtotime('today')) / 86400) : null; ?>
+      <article class="req <?= $r['type'] ?>">
+        <div class="req-main">
+          <div class="req-top"><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span><?= $r['status'] !== 'pending' ? badge($r['status']) : '' ?></div>
+          <a class="req-title" href="<?= $link ?>"><?= h($r['party']) ?></a>
+          <div class="req-line"><strong><?= h($r['ref']) ?></strong><?= $r['item'] !== '' ? ' · ' . h($r['item']) : '' ?><?= $r['bill_type'] ? ' · ' . strtoupper($r['bill_type']) . ' bill' : '' ?></div>
+          <div class="req-meta">
+            <span>👤 <?= h($r['by_name']) ?> · <?= $date($r['created_at']) ?></span>
+            <span>📨 to <?= h($r['approver'] ?? 'any admin') ?></span>
+            <?php if ($days !== null): ?><span class="<?= $days < 0 ? 'neg' : '' ?>">⏰ <?= $days < 0 ? abs($days) . ' days overdue' : ($days === 0 ? 'due today' : 'due ' . $date($r['due_date'])) ?></span><?php endif ?>
+            <?php if ($r['files']): ?><a href="<?= $link ?>">📎 <?= (int) $r['files'] ?> file<?= $r['files'] > 1 ? 's' : '' ?></a><?php endif ?>
+          </div>
+          <?php if ($r['status'] === 'rejected'): ?><div class="sub neg">Reason: <?= h($r['reject_reason']) ?></div><?php endif ?>
+        </div>
+        <div class="req-side">
+          <div class="req-amt"><?= money($r['amount']) ?></div>
+          <?= can('approve') ? review_buttons($r['type'], (int) $r['id'], $r['status']) : ($r['status'] === 'pending' ? badge('pending') : '') ?>
+        </div>
+      </article>
+    <?php endforeach ?>
+    </div>
 <?php
 }
+// Approve = one tap; Reject first shows a reason box (JS in foot()), then "Confirm reject"
 function review_buttons(string $type, int $id, string $status): string
 {
-    $f = fn($a, $inner) => '<form method="post" action="?p=approvals" class="inline">' . csrf_field() . "<input type=\"hidden\" name=\"type\" value=\"$type\"><input type=\"hidden\" name=\"id\" value=\"$id\"><input type=\"hidden\" name=\"a\" value=\"$a\">$inner</form>";
-    return '<div class="review">' . ($status !== 'approved' ? $f('approve', '<button class="ok">✅ Approve</button>') : '')
-        . ($status !== 'rejected' ? $f('reject', '<input name="reason" placeholder="Reason to reject" required><button class="no">❌ Reject</button>') : '') . '</div>';
+    $f = fn($a, $inner, $cls = '') => "<form method=\"post\" action=\"?p=approvals\" class=\"inline $cls\"" . ($cls ? ' hidden' : '') . '>' . csrf_field()
+        . "<input type=\"hidden\" name=\"type\" value=\"$type\"><input type=\"hidden\" name=\"id\" value=\"$id\"><input type=\"hidden\" name=\"a\" value=\"$a\">$inner</form>";
+    return '<div class="review">'
+        . ($status !== 'approved' ? $f('approve', '<button class="ok">✓ Approve</button>') : '')
+        . ($status !== 'rejected' ? '<button type="button" class="no" data-reject>✕ Reject</button>'
+            . $f('reject', '<input name="reason" placeholder="Reason for rejecting" required><button class="no">Confirm reject</button>', 'rej-form') : '')
+        . '</div>';
 }
 
 function msg_html(array $m): string
@@ -387,7 +408,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=16">
+<link rel="stylesheet" href="style.css?v=20">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
@@ -443,6 +464,12 @@ document.querySelectorAll('.tbl table').forEach(t => {
     [...tr.cells].forEach(c => { if (col > 0 && heads[col] && !c.dataset.label) c.dataset.label = heads[col]; col += c.colSpan; });
   });
 });
+// Reject: show the reason box (button turns into Cancel)
+document.querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', () => {
+  const form = btn.nextElementSibling, open = form.hidden;
+  form.hidden = !open; btn.textContent = open ? 'Cancel' : '✕ Reject';
+  if (open) form.querySelector('input[name=reason]').focus();
+}));
 // "Add new…" in party/product dropdowns shows a text box
 document.querySelectorAll('select[data-addnew]').forEach(s => {
   const box = s.nextElementSibling;

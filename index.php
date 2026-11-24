@@ -110,7 +110,7 @@ case 'home':
             <div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div><div class="sub"><?= $t['with_balance'] ?> invoices</div></article>
         </div>
         <h3>✅ Waiting for your approval</h3>
-        <?php if ($pending): requests_table(array_slice($pending, 0, 10), $date);
+        <?php if ($pending): requests_list(array_slice($pending, 0, 10), $date);
             if (count($pending) > 10): ?><p><a href="?p=approvals">Open all <?= count($pending) ?> requests →</a></p><?php endif;
         else: ?><div class="panel empty">All caught up — no requests waiting for you. 🎉</div><?php endif ?>
         <div class="two split">
@@ -178,7 +178,7 @@ case 'approvals':
         $title = 'Pending approvals';
     }
     head($title);
-    $rows ? requests_table($rows, $date) : print('<div class="panel empty">Nothing here right now. 🎉</div>');
+    $rows ? requests_list($rows, $date) : print('<div class="panel empty">Nothing here right now. 🎉</div>');
     foot();
 
 // ── invoice register (list + filters + Excel) ─────────────────────────────
