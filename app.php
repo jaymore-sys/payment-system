@@ -142,6 +142,21 @@ const MIGRATIONS = [
         "UPDATE receivables r SET r.status = 'pending' WHERE r.status = 'rejected' AND EXISTS (SELECT 1 FROM request_approvers ra JOIN users u ON u.id = ra.user_id
            WHERE ra.type = 'receipt' AND ra.request_id = r.id AND ra.decision = 'pending' AND u.role = 'admin')",
     ],
+    9 => [ // receipts: own customer list, sales person, state; no approval
+        "DROP VIEW IF EXISTS requests, upcoming_dues, current_balance, statement, payment_register",
+        "CREATE TABLE customers (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL UNIQUE, gst_registered BOOLEAN NOT NULL DEFAULT FALSE,
+           gstin VARCHAR(15), created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE sales_people (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL UNIQUE,
+           created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "ALTER TABLE receivables MODIFY party_id INT NULL, ADD COLUMN customer_id INT AFTER party_id, ADD COLUMN sales_person VARCHAR(100) AFTER customer_id,
+           ADD COLUMN state VARCHAR(60) AFTER sales_person, ADD FOREIGN KEY (customer_id) REFERENCES customers(id),
+           ADD INDEX (sales_person), ADD INDEX (state), ALTER status SET DEFAULT 'approved'",
+        // whoever receipts were from so far becomes a customer
+        "INSERT IGNORE INTO customers (name, gst_registered, gstin) SELECT DISTINCT p.name, p.gst_registered, p.gstin FROM receivables r JOIN parties p ON p.id = r.party_id",
+        "UPDATE receivables r JOIN parties p ON p.id = r.party_id JOIN customers c ON c.name = p.name SET r.customer_id = c.id",
+        "UPDATE receivables SET status = 'approved' WHERE status = 'pending'",
+        "DELETE FROM request_approvers WHERE type = 'receipt' AND decision = 'pending'",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -223,16 +238,17 @@ function enum_in(?string $v, array $allowed): string
 {
     return in_array($v, $allowed, true) ? $v : fail('Invalid choice');
 }
-function party_id(string $name, ?bool $gst = null, string $gstin = ''): int
+// supplier (parties) or customer (customers): find by name, add if new, update GST info when given
+function party_id(string $name, ?bool $gst = null, string $gstin = '', string $table = 'parties'): int
 {
     $gstin = strtoupper(trim($gstin));
     if ($gstin !== '' && !preg_match('/^[0-9A-Z]{15}$/', $gstin)) fail('GSTIN must be 15 letters/digits');
-    $p = q('SELECT id FROM parties WHERE name = ?', [$name])->fetch();
+    $p = q("SELECT id FROM $table WHERE name = ?", [$name])->fetch();
     if (!$p) {
-        q('INSERT INTO parties (name, gst_registered, gstin) VALUES (?, ?, ?)', [$name, (int) $gst, $gstin ?: null]);
+        q("INSERT INTO $table (name, gst_registered, gstin) VALUES (?, ?, ?)", [$name, (int) $gst, $gstin ?: null]);
         return (int) db()->lastInsertId();
     }
-    if ($gst !== null) q('UPDATE parties SET gst_registered = ?, gstin = COALESCE(?, gstin) WHERE id = ?', [(int) $gst, $gstin ?: null, $p['id']]);
+    if ($gst !== null) q("UPDATE $table SET gst_registered = ?, gstin = COALESCE(?, gstin) WHERE id = ?", [(int) $gst, $gstin ?: null, $p['id']]);
     return (int) $p['id'];
 }
 
@@ -300,10 +316,43 @@ function picked(string $name): string
     if ($v === '__new') $v = trim((string) ($_POST[$name . '_new'] ?? ''));
     return $v !== '' ? mb_substr(preg_replace('/\s+/', ' ', $v), 0, 190) : fail("Please choose or add a $name");
 }
-function product_name(string $n): string
+function add_name(string $table, string $n): string // products / sales_people dropdown lists
 {
-    q('INSERT IGNORE INTO products (name) VALUES (?)', [$n]);
+    q("INSERT IGNORE INTO $table (name) VALUES (?)", [$n]);
     return $n;
+}
+function product_name(string $n): string { return add_name('products', $n); }
+
+const STATES = ['Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jharkhand',
+    'Karnataka', 'Kerala', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab', 'Rajasthan', 'Sikkim',
+    'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal', 'Andaman and Nicobar Islands', 'Chandigarh',
+    'Dadra and Nagar Haveli and Daman and Diu', 'Delhi', 'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry'];
+
+// invoice copies: check every chosen file first (so nothing is saved if one is wrong), then store them
+function checked_uploads(string $field): array
+{
+    $f = $_FILES[$field] ?? null;
+    if (!$f) return [];
+    $out = [];
+    foreach ((array) $f['error'] as $i => $err) {
+        if ($err === UPLOAD_ERR_NO_FILE) continue;
+        $name = (string) ((array) $f['name'])[$i];
+        if ($err !== UPLOAD_ERR_OK) fail("Upload of $name failed. Max size is " . ini_get('upload_max_filesize') . '.');
+        if (((array) $f['size'])[$i] > 10 * 1024 * 1024) fail("$name is bigger than 10 MB");
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if (!isset(FILE_TYPES[$ext])) fail('Allowed files: ' . implode(', ', array_keys(FILE_TYPES)) . " (you chose $name)");
+        $out[] = ['tmp' => ((array) $f['tmp_name'])[$i], 'name' => $name, 'ext' => $ext];
+    }
+    return $out;
+}
+function save_uploads(int $payment_id, array $files): void
+{
+    if ($files && !is_dir(upload_dir())) mkdir(upload_dir(), 0750, true);
+    foreach ($files as $f) {
+        $stored = bin2hex(random_bytes(16)) . '.' . $f['ext'];
+        if (!move_uploaded_file($f['tmp'], upload_dir() . "/$stored")) fail('Could not save ' . $f['name']);
+        q('INSERT INTO attachments (payment_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)', [$payment_id, $stored, mb_substr($f['name'], 0, 255), me()['id']]);
+    }
 }
 
 // "Send request to": one or more admins, ticked. ALL of them must approve; one reject rejects.
@@ -346,7 +395,7 @@ function approvers_html(?string $list): string
         return h($name) . ' ' . ($icon[$d] ?? '');
     }, explode('|', $list)));
 }
-const REVIEWABLE = ['invoice' => 'payments', 'receipt' => 'receivables'];
+const REVIEWABLE = ['invoice' => 'payments']; // receipts need no approval
 // mine = I was asked and haven't answered yet, or none of the people asked is an admin any more (role changed)
 const MINE_SQL = "(EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = r.type AND ra.request_id = r.id AND ra.user_id = ? AND ra.decision = 'pending')
     OR NOT EXISTS (SELECT 1 FROM request_approvers ra JOIN users au ON au.id = ra.user_id WHERE ra.type = r.type AND ra.request_id = r.id AND au.role = 'admin'))";
@@ -538,7 +587,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=24">
+<link rel="stylesheet" href="style.css?v=25">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>

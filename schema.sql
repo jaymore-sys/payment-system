@@ -9,8 +9,8 @@
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   Invoices and receipts are requests sent to one or more admins; everyone votes, all yes = approved,
---   any no = rejected (can be sent again). Balance entries need no approval.
+--   Invoices are requests sent to one or more admins; everyone votes, all yes = approved,
+--   any no = rejected (can be sent again). Receipts and balance entries need no approval.
 
 SET NAMES utf8mb4;
 
@@ -18,7 +18,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '8');
+INSERT INTO app_meta VALUES ('schema', '9');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -36,6 +36,22 @@ CREATE TABLE products (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- customers money is received from (receipts); suppliers are in parties
+CREATE TABLE customers (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  name           VARCHAR(190) NOT NULL UNIQUE,
+  gst_registered BOOLEAN NOT NULL DEFAULT FALSE,
+  gstin          VARCHAR(15),
+  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE sales_people (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  name       VARCHAR(190) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- suppliers (invoices)
 CREATE TABLE parties (
   id             INT AUTO_INCREMENT PRIMARY KEY,
   name           VARCHAR(190) NOT NULL UNIQUE,
@@ -87,24 +103,28 @@ CREATE TABLE payouts (
 
 CREATE TABLE receivables (
   id          INT AUTO_INCREMENT PRIMARY KEY,
-  party_id    INT NOT NULL,
+  party_id    INT,                               -- old receipts only; new ones use customer_id
+  customer_id INT,
+  sales_person VARCHAR(100),
+  state       VARCHAR(60),
   amount      DECIMAL(14,2) NOT NULL,
   received_on DATE NOT NULL,
   against     ENUM('sales','capital') NOT NULL,
   note        TEXT,
-  status      ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  status      ENUM('pending','approved','rejected') NOT NULL DEFAULT 'approved', -- receipts need no approval (kept for old ones)
   approver_id INT,
   reject_reason TEXT,
   reviewed_by INT,
   created_by  INT NOT NULL,
   created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (party_id)    REFERENCES parties(id),
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
   FOREIGN KEY (approver_id) REFERENCES users(id),
   FOREIGN KEY (reviewed_by) REFERENCES users(id),
   FOREIGN KEY (created_by)  REFERENCES users(id),
   CONSTRAINT receivable_positive CHECK (amount > 0),
   CONSTRAINT receipt_reject_reason CHECK (status <> 'rejected' OR TRIM(COALESCE(reject_reason,'')) <> ''),
-  INDEX (received_on)
+  INDEX (received_on), INDEX (sales_person), INDEX (state)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- opening balance, corrections (+/−), other costs (−); admin and administrator add them directly (status kept for old requests)
@@ -201,26 +221,20 @@ CREATE OR REPLACE VIEW statement AS
   SELECT c.entry_date, c.amount, c.kind, c.note AS detail, c.id AS ref_id, c.id AS row_id
     FROM cash_entries c WHERE c.status = 'approved'
   UNION ALL
-  SELECT r.received_on, r.amount, 'receipt', CONCAT(p.name, ' (', r.against, ')'), r.id, r.id
-    FROM receivables r JOIN parties p ON p.id = r.party_id WHERE r.status = 'approved'
+  SELECT r.received_on, r.amount, 'receipt', CONCAT(COALESCE(cu.name, p.name, 'Receipt'), ' (', r.against, ')'), r.id, r.id
+    FROM receivables r LEFT JOIN customers cu ON cu.id = r.customer_id LEFT JOIN parties p ON p.id = r.party_id WHERE r.status = 'approved'
   UNION ALL
   SELECT po.paid_on, -po.amount, 'payment', CONCAT(p.name, ': ', COALESCE(NULLIF(pm.invoice_no, ''), pm.products)), pm.id, po.id
     FROM payouts po JOIN payments pm ON pm.id = po.payment_id JOIN parties p ON p.id = pm.party_id WHERE po.in_balance;
 
--- everything that needs an admin's yes/no, in one list (Approvals page)
+-- invoices that need an admin's yes/no (Approvals page)
 CREATE OR REPLACE VIEW requests AS
   SELECT 'invoice' AS type, pm.id, p.name AS party, COALESCE(NULLIF(pm.invoice_no, ''), CONCAT('#', pm.id)) AS ref,
          pm.products AS item, pm.bill_type, pm.due_date, (SELECT COUNT(*) FROM attachments a WHERE a.payment_id = pm.id) AS files,
          (SELECT GROUP_CONCAT(CONCAT(u.name, ':', ra.decision) ORDER BY u.name SEPARATOR '|') FROM request_approvers ra JOIN users u ON u.id = ra.user_id
            WHERE ra.type = 'invoice' AND ra.request_id = pm.id) AS approvers,
          pm.amount, pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
-    FROM payments pm JOIN parties p ON p.id = pm.party_id
-  UNION ALL
-  SELECT 'receipt', r.id, p.name, CONCAT('Against ', r.against), COALESCE(r.note, ''), NULL, NULL, 0,
-         (SELECT GROUP_CONCAT(CONCAT(u.name, ':', ra.decision) ORDER BY u.name SEPARATOR '|') FROM request_approvers ra JOIN users u ON u.id = ra.user_id
-           WHERE ra.type = 'receipt' AND ra.request_id = r.id),
-         r.amount, r.status, r.approver_id, r.reject_reason, r.created_by, r.created_at
-    FROM receivables r JOIN parties p ON p.id = r.party_id;
+    FROM payments pm JOIN parties p ON p.id = pm.party_id;
 
 CREATE OR REPLACE VIEW current_balance AS
   SELECT COALESCE(SUM(amount), 0) AS balance FROM statement;

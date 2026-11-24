@@ -139,6 +139,8 @@ case 'home':
             <tr><td>Total outstanding</td><td class="right"><strong><?= money($t['outstanding']) ?></strong></td></tr>
             <tr><td>Invoices with balance</td><td class="right"><?= $t['with_balance'] ?></td></tr>
             <tr><td>Fully paid invoices</td><td class="right"><?= $t['fully_paid'] ?></td></tr>
+            <?php [$rc, $ra] = q("SELECT COUNT(*), COALESCE(SUM(outstanding), 0) FROM payment_register WHERE status = 'approved' AND outstanding > 0")->fetch(PDO::FETCH_NUM); ?>
+            <tr><td><a href="?p=payments&pay=ready">💸 Approved, ready to pay (<?= (int) $rc ?>)</a></td><td class="right"><strong><?= money($ra) ?></strong></td></tr>
             <tr><td>Paid this month</td><td class="right neg"><?= money($mon['paid']) ?></td></tr>
             <tr><td>Received this month</td><td class="right pos"><?= money($mon['received']) ?></td></tr>
           </table></article>
@@ -216,6 +218,7 @@ case 'payments':
     if ($d = date_or_null($_GET['to'] ?? ''))   { $w[] = "$by <= ?"; $args[] = $d; $desc[] = "$by to $d"; }
     if (in_array($_GET['status'] ?? '', STATUSES, true)) { $w[] = 'status = ?'; $args[] = $_GET['status']; $desc[] = $_GET['status']; }
     if (in_array($_GET['pay'] ?? '', PAY_STATES, true)) { $w[] = 'pay_status = ?'; $args[] = $_GET['pay']; $desc[] = $_GET['pay']; }
+    if (($_GET['pay'] ?? '') === 'ready') { $w[] = "status = 'approved' AND outstanding > 0"; $desc[] = 'ready to pay'; }
     if (in_array($_GET['bill'] ?? '', ['gst', 'cash'], true)) { $w[] = 'bill_type = ?'; $args[] = $_GET['bill']; $desc[] = strtoupper($_GET['bill']) . ' bills'; }
     if (($s = trim($_GET['party'] ?? '')) !== '') { $w[] = 'party LIKE ?'; $args[] = "%$s%"; $desc[] = "party: $s"; }
     if (($s = trim($_GET['product'] ?? '')) !== '') { $w[] = 'products = ?'; $args[] = $s; $desc[] = "product: $s"; }
@@ -236,6 +239,7 @@ case 'payments':
       <label>From<input type="date" name="from" value="<?= h($_GET['from'] ?? '') ?>"></label>
       <label>To<input type="date" name="to" value="<?= h($_GET['to'] ?? '') ?>"></label>
       <label>Payment<select name="pay"><option value="">All</option>
+        <option value="ready" <?= $sel('pay', 'ready') ?>>💸 Ready to pay</option>
         <?php foreach (PAY_STATES as $st): ?><option <?= $sel('pay', $st) ?>><?= $st ?></option><?php endforeach ?></select></label>
       <label>Approval<select name="status"><option value="">All</option>
         <?php foreach (STATUSES as $st): ?><option <?= $sel('status', $st) ?>><?= $st ?></option><?php endforeach ?></select></label>
@@ -254,7 +258,8 @@ case 'payments':
         <td class="wrap"><a href="?p=payment&id=<?= $r['id'] ?>"><?= h($r['party']) ?></a></td>
         <td class="right"><?= money($r['amount']) ?></td><td class="right pos"><?= money($r['paid']) ?></td><td class="right"><strong><?= money($r['outstanding']) ?></strong></td>
         <td><?= $date($r['due_date']) ?><?= $r['days_overdue'] > 0 ? '<div class="sub neg">' . (int) $r['days_overdue'] . ' days overdue</div>' : '' ?></td>
-        <td><?= badge($r['pay_status']) ?><?= $r['status'] !== 'approved' ? ' ' . badge($r['status']) : '' ?></td>
+        <td><?= badge($r['pay_status']) ?><?= $r['status'] !== 'approved' ? ' ' . badge($r['status']) : '' ?>
+          <?= $r['status'] === 'approved' && $r['outstanding'] > 0 && can('pay') ? '<a class="pay-btn" href="?p=payment&id=' . $r['id'] . '#pay">💸 Pay</a>' : '' ?></td>
         <td class="wrap"><?= h(mb_strimwidth($r['products'], 0, 32, '…')) ?></td></tr>
     <?php endforeach;
     if (!$rows): ?><tr><td colspan="8" class="empty">No invoices match.</td></tr><?php endif ?></tbody>
@@ -295,7 +300,7 @@ case 'payment':
             if (!$editable) fail('This invoice cannot be edited by you', 403);
             $amount = amount_in($_POST['amount'] ?? '');
             if ($pm && paise($amount) < paise($pm['paid'])) fail('Amount cannot be less than what is already paid (' . money($pm['paid']) . ')');
-            [$party, $product] = [picked('party'), picked('product')];
+            [$party, $product, $files] = [picked('party'), picked('product'), checked_uploads('files')];
             $f = [trim($_POST['invoice_no'] ?? '') ?: null, date_in($_POST['invoice_date'] ?? ''), enum_in($_POST['bill_type'] ?? '', ['gst', 'cash']),
                   $amount, date_in($_POST['due_date'] ?? ''), ($approvers = approver_in())[0]];
             // same invoice no. already entered for this party? warn (possible double payment), allow "Save anyway"
@@ -308,7 +313,8 @@ case 'payment':
                     <div class="panel" style="margin-top:1rem"><strong>Already in the app:</strong><ul>
                       <?php foreach ($dups as $d): ?><li><a href="?p=payment&id=<?= $d['id'] ?>" target="_blank">Invoice #<?= $d['id'] ?></a> · <?= $date($d['invoice_date']) ?> · <?= money($d['amount']) ?></li><?php endforeach ?>
                     </ul>
-                    <form method="post"><?= csrf_field() ?>
+                    <form method="post" enctype="multipart/form-data"><?= csrf_field() ?>
+                      <?php if ($files): ?><label>📎 Attach the invoice copy again<input type="file" name="files[]" accept="image/*,.pdf" multiple></label><?php endif ?>
                       <?php foreach ($_POST as $k => $v) if ($k !== 'csrf') foreach ((array) $v as $one) echo '<input type="hidden" name="' . h($k) . (is_array($v) ? '[]' : '') . '" value="' . h((string) $one) . '">'; ?>
                       <input type="hidden" name="dup_ok" value="1">
                       <div class="row"><a href="javascript:history.back()" role="button" class="secondary">← Go back and fix</a><button>Save anyway</button></div>
@@ -324,6 +330,7 @@ case 'payment':
                 q("UPDATE payments SET party_id = ?, invoice_no = ?, invoice_date = ?, products = ?, bill_type = ?, amount = ?, due_date = ?, approver_id = ?,
                    status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $id]);
             }
+            save_uploads($id, $files);
             send_request('invoice', $id, $approvers, (bool) $pm, $pm ? 'invoice details were edited' : '');
             go("?p=payment&id=$id", 'Saved and sent for approval');
         case 'pay': // record a full or part payment
@@ -364,15 +371,7 @@ case 'payment':
             break;
         case 'upload':
             need('files');
-            $file = $_FILES['file'] ?? null;
-            if (!$file || $file['error'] !== UPLOAD_ERR_OK) fail('Upload failed. Max size is ' . ini_get('upload_max_filesize') . '.');
-            if ($file['size'] > 10 * 1024 * 1024) fail('Max file size is 10 MB');
-            $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-            if (!isset(FILE_TYPES[$ext])) fail('Allowed files: ' . implode(', ', array_keys(FILE_TYPES)));
-            if (!is_dir(upload_dir())) mkdir(upload_dir(), 0750, true);
-            $name = bin2hex(random_bytes(16)) . ".$ext";
-            if (!move_uploaded_file($file['tmp_name'], upload_dir() . "/$name")) fail('Could not save the file');
-            q('INSERT INTO attachments (payment_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)', [$id, $name, mb_substr($file['name'], 0, 255), $uid]);
+            save_uploads($id, checked_uploads('file') ?: fail('Choose a file to upload'));
             break;
         case 'unattach':
             $att = q('SELECT * FROM attachments WHERE id = ? AND payment_id = ?', [(int) ($_POST['att'] ?? 0), $id])->fetch() ?: fail('File not found', 404);
@@ -424,7 +423,8 @@ case 'payment':
         <?php endforeach ?></tbody></table></div>
       <?php else: ?><p><small>No payments yet.</small></p><?php endif ?>
       <?php if ($pm['outstanding'] > 0 && can('pay') && $pm['status'] === 'approved'): ?>
-        <form method="post" class="panel"><?= csrf_field() ?><input type="hidden" name="a" value="pay">
+        <form method="post" class="panel" id="pay"><?= csrf_field() ?><input type="hidden" name="a" value="pay">
+          <strong>💸 Record payment</strong> <small>— pay the full outstanding or any part of it</small><br><br>
           <div class="grid">
             <label>Amount (₹) — full or part<input name="amount" inputmode="decimal" value="<?= h($pm['outstanding']) ?>" required></label>
             <label>Paid on<input type="date" name="paid_on" value="<?= date('Y-m-d') ?>" required></label>
@@ -445,7 +445,7 @@ case 'payment':
 
     if ($editable): ?>
       <details class="panel" <?= $pm ? '' : 'open' ?>><summary><?= $pm ? '✏️ Edit details' : '🧾 Invoice details' ?></summary>
-        <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="save">
+        <form method="post" enctype="multipart/form-data"><?= csrf_field() ?><input type="hidden" name="a" value="save">
           <div class="grid"><?= pick('party', 'parties', $pm['party'] ?? null, 'Party') ?><?= pick('product', 'products', $pm['products'] ?? null, 'Product') ?></div>
           <div class="grid">
             <label>Invoice no.<input name="invoice_no" value="<?= h($pm['invoice_no'] ?? '') ?>" placeholder="leave empty if none"></label>
@@ -457,6 +457,8 @@ case 'payment':
             <label>Due date<input type="date" name="due_date" value="<?= h($pm['due_date'] ?? '') ?>" required></label>
             <?= approver_select($pm ? approvers_of('invoice', $id) : []) ?>
           </div>
+          <label>📎 Invoice copy <small>(photo or PDF — you can pick several; on a phone you can use the camera)</small>
+            <input type="file" name="files[]" accept="image/*,.pdf" multiple></label>
           <?php if ($pm): ?><small>Saving changes sends this invoice back for approval.</small><?php endif ?>
           <button><?= $pm ? 'Save & send for approval' : '📨 Create & send for approval' ?></button>
         </form>
@@ -475,7 +477,7 @@ case 'payment':
       <?php endforeach ?></ul><?php endif ?>
       <?php if (can('files')): ?>
       <form method="post" enctype="multipart/form-data"><?= csrf_field() ?><input type="hidden" name="a" value="upload">
-        <div class="row"><input type="file" name="file" accept="image/*,.pdf,.xls,.xlsx" required><button>⬆ Upload</button></div></form>
+        <div class="row"><input type="file" name="file[]" accept="image/*,.pdf,.xls,.xlsx" multiple required><button>⬆ Upload</button></div></form>
       <?php endif ?>
 
       <h3>💬 Discussion & follow-ups</h3>
@@ -535,73 +537,79 @@ case 'chat':
     </div>
     <?php foot();
 
-// ── receipts (money received): administrator sends, admin approves ────────
+// ── receipts (money received from customers): no approval, count at once ─
 case 'receivables':
     if ($post) {
         if ($a === 'delete') {
             need('manage');
             q('DELETE FROM receivables WHERE id = ?', [(int) ($_POST['id'] ?? 0)]);
-            q("DELETE FROM request_approvers WHERE type = 'receipt' AND request_id = ?", [(int) ($_POST['id'] ?? 0)]);
-            q("DELETE FROM request_log WHERE type = 'receipt' AND request_id = ?", [(int) ($_POST['id'] ?? 0)]);
             go('?p=receivables', 'Receipt deleted');
         }
         need('request');
-        [$party, $amt, $on, $against, $approvers] = [picked('party'), amount_in($_POST['amount'] ?? ''), date_in($_POST['received_on'] ?? ''),
-                                                     enum_in($_POST['against'] ?? '', ['sales', 'capital']), approver_in()];
-        q('INSERT INTO receivables (party_id, amount, received_on, against, note, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)', [
-            party_id($party, isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? ''), $amt, $on, $against, trim($_POST['note'] ?? '') ?: null, $approvers[0], me()['id']]);
-        send_request('receipt', (int) db()->lastInsertId(), $approvers, false);
-        go('?p=receivables', 'Receipt sent for approval');
+        // check everything first, then add new customer / sales person names
+        [$customer, $sp, $amt, $on, $state, $against] = [picked('customer'), picked('sales_person'), amount_in($_POST['amount'] ?? ''),
+            date_in($_POST['received_on'] ?? ''), enum_in($_POST['state'] ?? '', STATES), enum_in($_POST['against'] ?? '', ['sales', 'capital'])];
+        q("INSERT INTO receivables (customer_id, sales_person, state, amount, received_on, against, note, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?)", [
+            party_id($customer, isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? '', 'customers'), add_name('sales_people', $sp), $state,
+            $amt, $on, $against, trim($_POST['note'] ?? '') ?: null, me()['id']]);
+        go('?p=receivables', 'Receipt saved — added to the balance');
     }
     $w = ['1=1']; $args = [];
     if ($d = date_or_null($_GET['from'] ?? '')) { $w[] = 'r.received_on >= ?'; $args[] = $d; }
     if ($d = date_or_null($_GET['to'] ?? ''))   { $w[] = 'r.received_on <= ?'; $args[] = $d; }
+    if (($s = trim($_GET['sp'] ?? '')) !== '') { $w[] = 'r.sales_person = ?'; $args[] = $s; }
+    if (in_array($_GET['state'] ?? '', STATES, true)) { $w[] = 'r.state = ?'; $args[] = $_GET['state']; }
     if (in_array($_GET['against'] ?? '', ['sales', 'capital'], true)) { $w[] = 'r.against = ?'; $args[] = $_GET['against']; }
-    if (in_array($_GET['gst'] ?? '', ['0', '1'], true)) { $w[] = 'p.gst_registered = ?'; $args[] = $_GET['gst']; }
-    if (in_array($_GET['status'] ?? '', STATUSES, true)) { $w[] = 'r.status = ?'; $args[] = $_GET['status']; }
-    if (($s = trim($_GET['party'] ?? '')) !== '') { $w[] = 'p.name LIKE ?'; $args[] = "%$s%"; }
-    $rows = q('SELECT r.id, p.name AS party, IF(p.gst_registered, \'Yes\', \'No\') AS gst_registered, p.gstin, r.amount, r.received_on, r.against, r.note, r.status,
-                      r.reject_reason, rq.approvers
-               FROM receivables r JOIN parties p ON p.id = r.party_id LEFT JOIN requests rq ON rq.type = \'receipt\' AND rq.id = r.id
+    if (in_array($_GET['gst'] ?? '', ['0', '1'], true)) { $w[] = 'COALESCE(c.gst_registered, p.gst_registered) = ?'; $args[] = $_GET['gst']; }
+    if (($s = trim($_GET['customer'] ?? '')) !== '') { $w[] = 'COALESCE(c.name, p.name) LIKE ?'; $args[] = "%$s%"; }
+    $rows = q('SELECT r.received_on, COALESCE(c.name, p.name) AS customer, r.sales_person, r.state, r.against, r.amount,
+                      IF(COALESCE(c.gst_registered, p.gst_registered), \'Yes\', \'No\') AS gst_registered, COALESCE(c.gstin, p.gstin) AS gstin, r.note, r.status, r.id
+               FROM receivables r LEFT JOIN customers c ON c.id = r.customer_id LEFT JOIN parties p ON p.id = r.party_id
                WHERE ' . implode(' AND ', $w) . ' ORDER BY r.received_on DESC, r.id DESC', $args)->fetchAll();
-    if (isset($_GET['csv'])) csv('receipts', $rows);
-    $approved = array_filter($rows, fn($r) => $r['status'] === 'approved');
-    head('Receipts', '<a href="?p=receivables&csv=1" role="button" class="secondary">⬇ Excel (CSV)</a>');
+    if (isset($_GET['csv'])) csv('receipts', array_map(fn($r) => array_diff_key($r, ['id' => 1]), $rows));
+    $counted = array_filter($rows, fn($r) => $r['status'] !== 'rejected');
+    $qs = http_build_query(array_diff_key($_GET, ['p' => 1]));
+    head('Receipts', '<a href="?p=receivables&csv=1' . ($qs ? '&' . h($qs) : '') . '" role="button" class="secondary">⬇ Excel (CSV)</a>');
     if (can('request')): ?>
     <details class="panel" id="add" open><summary>＋ New receipt (money received)</summary>
       <form method="post"><?= csrf_field() ?>
-        <div class="grid"><?= pick('party', 'parties', null, 'Party') ?>
+        <div class="grid"><?= pick('customer', 'customers', null, 'Customer') ?>
           <label>Amount (₹)<input name="amount" inputmode="decimal" required></label>
           <label>Date received<input type="date" name="received_on" value="<?= date('Y-m-d') ?>" required></label></div>
+        <div class="grid"><?= pick('sales_person', 'sales_people', null, 'Sales person') ?>
+          <label>State<select name="state" required><option value="">— Select state —</option>
+            <?php foreach (STATES as $st): ?><option><?= h($st) ?></option><?php endforeach ?></select></label>
+          <label>Against<select name="against"><option value="sales">Sales</option><option value="capital">Capital</option></select></label></div>
         <div class="grid">
-          <label>Against<select name="against"><option value="sales">Sales</option><option value="capital">Capital</option></select></label>
+          <label class="check"><input type="checkbox" name="gst" value="1"> Customer is GST registered</label>
           <label>GSTIN (optional)<input name="gstin" maxlength="15"></label>
-          <label class="check"><input type="checkbox" name="gst" value="1"> Party is GST registered</label></div>
-        <div class="grid"><label>Note<input name="note" placeholder="optional"></label><?= approver_select() ?></div>
-        <button>📨 Send for approval</button>
+          <label>Note<input name="note" placeholder="optional"></label></div>
+        <button>💰 Save receipt</button>
       </form>
     </details>
     <?php endif ?>
     <form class="filters panel"><input type="hidden" name="p" value="receivables">
       <label>From<input type="date" name="from" value="<?= h($_GET['from'] ?? '') ?>"></label>
       <label>To<input type="date" name="to" value="<?= h($_GET['to'] ?? '') ?>"></label>
+      <label>Sales person<select name="sp"><option value="">All</option>
+        <?php foreach (q('SELECT name FROM sales_people ORDER BY name')->fetchAll(PDO::FETCH_COLUMN) as $n): ?><option <?= $sel('sp', $n) ?>><?= h($n) ?></option><?php endforeach ?></select></label>
+      <label>State<select name="state"><option value="">All</option>
+        <?php foreach (STATES as $st): ?><option <?= $sel('state', $st) ?>><?= h($st) ?></option><?php endforeach ?></select></label>
       <label>Against<select name="against"><option value="">All</option><option value="sales" <?= $sel('against', 'sales') ?>>Sales</option><option value="capital" <?= $sel('against', 'capital') ?>>Capital</option></select></label>
       <label>GST registered<select name="gst"><option value="">All</option><option value="1" <?= $sel('gst', '1') ?>>Yes</option><option value="0" <?= $sel('gst', '0') ?>>No</option></select></label>
-      <label>Approval<select name="status"><option value="">All</option><?php foreach (STATUSES as $st): ?><option <?= $sel('status', $st) ?>><?= $st ?></option><?php endforeach ?></select></label>
-      <label>Party<input name="party" value="<?= h($_GET['party'] ?? '') ?>" placeholder="Search"></label>
+      <label>Customer<input name="customer" value="<?= h($_GET['customer'] ?? '') ?>" placeholder="Search"></label>
       <button>Filter</button>
     </form>
-    <div class="tbl"><table><thead><tr><th>Date</th><th>Party</th><th>GST reg.</th><th>Against</th><th class="right">Amount</th><th>Approval</th><th>Note</th><?= can('manage') ? '<th></th>' : '' ?></tr></thead><tbody>
+    <div class="tbl"><table><thead><tr><th>Customer</th><th>Date</th><th>Sales person</th><th>State</th><th>Against</th><th class="right">Amount</th><th>GST reg.</th><th>Note</th><?= can('manage') ? '<th></th>' : '' ?></tr></thead><tbody>
     <?php foreach ($rows as $r): ?>
-      <tr><td><?= $date($r['received_on']) ?></td><td><?= h($r['party']) ?></td><td><?= $r['gst_registered'] ?><?= $r['gstin'] ? ' <small>' . h($r['gstin']) . '</small>' : '' ?></td>
-        <td><?= h(ucfirst($r['against'])) ?></td><td class="right pos"><strong><?= money($r['amount']) ?></strong></td>
-        <td><?= badge($r['status']) ?><?= $r['status'] === 'pending' && $r['approvers'] ? '<div class="sub">' . approvers_html($r['approvers']) . '</div>' : '' ?>
-          <?= $r['status'] === 'rejected' && can('request') ? '<div><a href="?p=resend&type=receipt&id=' . (int) $r['id'] . '">🔁 Send again</a></div>' : '' ?>
-          <?= $r['status'] === 'rejected' ? '<br><small class="neg">' . h($r['reject_reason']) . '</small>' : '' ?></td><td><?= h($r['note']) ?></td>
-        <?php if (can('manage')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this receipt?')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
+      <tr><td><strong><?= h($r['customer'] ?? '—') ?></strong><?= $r['status'] === 'rejected' ? ' ' . badge('rejected') : '' ?></td>
+        <td><?= $date($r['received_on']) ?></td><td><?= h($r['sales_person'] ?? '—') ?></td><td><?= h($r['state'] ?? '—') ?></td>
+        <td><?= h(ucfirst($r['against'])) ?></td><td class="right <?= $r['status'] === 'rejected' ? '' : 'pos' ?>"><strong><?= money($r['amount']) ?></strong></td>
+        <td><?= $r['gst_registered'] ?><?= $r['gstin'] ? ' <small>' . h($r['gstin']) . '</small>' : '' ?></td><td class="wrap"><?= h($r['note']) ?></td>
+        <?php if (can('manage')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this receipt? The balance changes back.')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
     <?php endforeach;
-    if (!$rows): ?><tr><td colspan="8" class="empty">No receipts yet.</td></tr><?php endif ?></tbody>
-    <tfoot><tr><th colspan="4"><?= count($rows) ?> receipts · total of approved</th><th class="right"><?= money(array_sum(array_map(fn($r) => paise($r['amount']), $approved)) / 100) ?></th><th colspan="3"></th></tr></tfoot></table></div>
+    if (!$rows): ?><tr><td colspan="9" class="empty">No receipts match.</td></tr><?php endif ?></tbody>
+    <tfoot><tr><th colspan="5"><?= count($counted) ?> receipts</th><th class="right"><?= money(array_sum(array_map(fn($r) => paise($r['amount']), $counted)) / 100) ?></th><th colspan="3"></th></tr></tfoot></table></div>
     <?php foot();
 
 // ── balance: admin and administrator add entries directly (no approval) ─
@@ -624,7 +632,7 @@ case 'cash':
     $bal = q('SELECT balance FROM current_balance')->fetchColumn();
     head('Balance'); ?>
     <div class="stats"><article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article></div>
-    <p class="note">Approved receipts add to the balance and recorded payments take away from it automatically. Use this page for the opening balance, corrections and other costs — they count straight away.</p>
+    <p class="note">Receipts add to the balance and recorded payments take away from it automatically. Use this page for the opening balance, corrections and other costs — they count straight away.</p>
     <?php if (can('balance')): ?>
     <form method="post" class="panel"><?= csrf_field() ?>
       <strong>＋ Add balance entry</strong><br><br>
