@@ -9,7 +9,8 @@
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   Invoices and receipts are requests sent to one or more admins; all must approve. Balance entries need no approval.
+--   Invoices and receipts are requests sent to one or more admins; everyone votes, all yes = approved,
+--   any no = rejected (can be sent again). Balance entries need no approval.
 
 SET NAMES utf8mb4;
 
@@ -17,7 +18,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '7');
+INSERT INTO app_meta VALUES ('schema', '8');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -152,7 +153,7 @@ CREATE TABLE attachments (
   FOREIGN KEY (uploaded_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- who an invoice / receipt request was sent to, and each admin's answer; ALL must approve, one reject rejects
+-- who an invoice / receipt request was sent to, and each admin's vote; everyone votes, all yes = approved, any no = rejected
 CREATE TABLE request_approvers (
   type       ENUM('invoice','receipt') NOT NULL,
   request_id INT NOT NULL,
@@ -163,6 +164,19 @@ CREATE TABLE request_approvers (
   PRIMARY KEY (type, request_id, user_id),
   FOREIGN KEY (user_id) REFERENCES users(id),
   INDEX (user_id, decision)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- history of every request: sent, each vote, sent again (kept across rounds)
+CREATE TABLE request_log (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  type       ENUM('invoice','receipt') NOT NULL,
+  request_id INT NOT NULL,
+  user_id    INT NOT NULL,
+  action     ENUM('sent','resent','approved','rejected') NOT NULL,
+  note       TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  INDEX (type, request_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ── views (re-created by the app after every migration) ──────────────────

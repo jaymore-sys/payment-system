@@ -125,6 +125,23 @@ const MIGRATIONS = [
         "INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at)
            SELECT 'receipt', id, approver_id, status, reject_reason, IF(status = 'pending', NULL, NOW()) FROM receivables WHERE approver_id IS NOT NULL",
     ],
+    8 => [ // everyone votes (a reject no longer ends it early) + history log + send again
+        "CREATE TABLE request_log (id INT AUTO_INCREMENT PRIMARY KEY, type ENUM('invoice','receipt') NOT NULL, request_id INT NOT NULL, user_id INT NOT NULL,
+           action ENUM('sent','resent','approved','rejected') NOT NULL, note TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           FOREIGN KEY (user_id) REFERENCES users(id), INDEX (type, request_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        // history so far: who sent each request, then each vote already cast
+        "INSERT INTO request_log (type, request_id, user_id, action, created_at)
+           SELECT 'invoice', pm.id, pm.created_by, 'sent', pm.created_at FROM payments pm WHERE EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = 'invoice' AND ra.request_id = pm.id)",
+        "INSERT INTO request_log (type, request_id, user_id, action, created_at)
+           SELECT 'receipt', r.id, r.created_by, 'sent', r.created_at FROM receivables r WHERE EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = 'receipt' AND ra.request_id = r.id)",
+        "INSERT INTO request_log (type, request_id, user_id, action, note, created_at)
+           SELECT type, request_id, user_id, decision, reason, COALESCE(decided_at, NOW()) FROM request_approvers WHERE decision <> 'pending'",
+        // requests rejected early while other admins had not voted yet: reopen them for those admins
+        "UPDATE payments pm SET pm.status = 'pending' WHERE pm.status = 'rejected' AND EXISTS (SELECT 1 FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+           WHERE ra.type = 'invoice' AND ra.request_id = pm.id AND ra.decision = 'pending' AND u.role = 'admin')",
+        "UPDATE receivables r SET r.status = 'pending' WHERE r.status = 'rejected' AND EXISTS (SELECT 1 FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+           WHERE ra.type = 'receipt' AND ra.request_id = r.id AND ra.decision = 'pending' AND u.role = 'admin')",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -337,31 +354,94 @@ function can_decide(string $type, int $id): bool
 {
     return can('approve') && (bool) q("SELECT 1 FROM requests r WHERE r.type = ? AND r.id = ? AND r.status = 'pending' AND " . MINE_SQL, [$type, $id, me()['id']])->fetch();
 }
-// returns the message to show after the decision
+function log_request(string $type, int $id, string $action, ?string $note = null): void
+{
+    q('INSERT INTO request_log (type, request_id, user_id, action, note) VALUES (?, ?, ?, ?, ?)', [$type, $id, me()['id'], $action, $note]);
+}
+function names_of(array $ids): string
+{
+    return $ids ? implode(', ', q('SELECT name FROM users WHERE id IN (' . implode(',', array_fill(0, count($ids), '?')) . ') ORDER BY name', $ids)->fetchAll(PDO::FETCH_COLUMN)) : '';
+}
+// everyone asked votes; when nobody (still an admin) is waiting: all yes = approved, any no = rejected
 function review(string $type, int $id, bool $approve, string $reason = ''): string
 {
     need('approve');
     $table = REVIEWABLE[$type] ?? fail('Unknown request type');
     if (!$approve && $reason === '') fail('Please give a reason for rejecting');
     $uid = (int) me()['id'];
-    db()->beginTransaction(); // lock the request so two admins answering at once are counted correctly
+    db()->beginTransaction(); // lock the request so admins voting at the same moment are counted correctly
     $r = q("SELECT status FROM $table WHERE id = ? FOR UPDATE", [$id])->fetch() ?: fail('Request not found', 404);
     if ($r['status'] !== 'pending') fail("This request is already {$r['status']}.");
-    if (!can_decide($type, $id)) fail(in_array($uid, approvers_of($type, $id), true) ? 'You have already answered this request.' : 'This request was sent to other admins.', 403);
+    if (!can_decide($type, $id)) fail(in_array($uid, approvers_of($type, $id), true) ? 'You have already voted on this request.' : 'This request was sent to other admins.', 403);
     if (!$approve && $type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
     q("INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at) VALUES (?, ?, ?, ?, ?, NOW())
        ON DUPLICATE KEY UPDATE decision = VALUES(decision), reason = VALUES(reason), decided_at = NOW()", [$type, $id, $uid, $approve ? 'approved' : 'rejected', $approve ? null : $reason]);
-    if (!$approve) {
-        q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?", [$uid, $reason, $id]);
-        db()->commit();
-        return 'Rejected';
-    }
-    // approved only when every admin asked (who is still an admin) has said yes
+    log_request($type, $id, $approve ? 'approved' : 'rejected', $approve ? null : $reason);
     $waiting = q("SELECT u.name FROM request_approvers ra JOIN users u ON u.id = ra.user_id
-                  WHERE ra.type = ? AND ra.request_id = ? AND ra.decision <> 'approved' AND u.role = 'admin'", [$type, $id])->fetchAll(PDO::FETCH_COLUMN);
-    if (!$waiting) q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [$uid, $id]);
+                  WHERE ra.type = ? AND ra.request_id = ? AND ra.decision = 'pending' AND u.role = 'admin' ORDER BY u.name", [$type, $id])->fetchAll(PDO::FETCH_COLUMN);
+    if ($waiting) {
+        db()->commit();
+        return 'Your vote is saved. Still waiting for: ' . implode(', ', $waiting);
+    }
+    $no = q("SELECT u.name, ra.reason FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+             WHERE ra.type = ? AND ra.request_id = ? AND ra.decision = 'rejected' ORDER BY u.name", [$type, $id])->fetchAll();
+    if ($no) {
+        q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?",
+          [$uid, implode('; ', array_map(fn($v) => "{$v['name']}: {$v['reason']}", $no)), $id]);
+    } else {
+        q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [$uid, $id]);
+    }
+    $n = count(approvers_of($type, $id));
     db()->commit();
-    return $waiting ? 'Your approval is saved. Still waiting for: ' . implode(', ', $waiting) : 'Approved';
+    return ($no ? 'Rejected' : 'Approved') . ($n > 1 ? " — all $n votes are in" . ($no ? ' (no from ' . implode(', ', array_column($no, 'name')) . ')' : '') : '');
+}
+// send a request (again): everyone asked starts at "waiting", history keeps the old votes
+function send_request(string $type, int $id, array $approvers, bool $again, string $note = ''): void
+{
+    set_approvers($type, $id, $approvers);
+    if ($again) q('UPDATE ' . REVIEWABLE[$type] . " SET status = 'pending', reviewed_by = NULL, reject_reason = NULL, approver_id = ? WHERE id = ?", [$approvers[0], $id]);
+    log_request($type, $id, $again ? 'resent' : 'sent', 'to ' . names_of($approvers) . ($note !== '' ? " — $note" : ''));
+}
+// votes for many requests at once: ["invoice:12" => [[name, decision, reason, decided_at], ...]]
+function votes_for(array $rows): array
+{
+    $out = [];
+    foreach (['invoice', 'receipt'] as $type) {
+        $ids = array_map(fn($r) => (int) $r['id'], array_filter($rows, fn($r) => $r['type'] === $type));
+        if (!$ids) continue;
+        $sql = 'SELECT ra.request_id, u.name, ra.decision, ra.reason, ra.decided_at FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+                WHERE ra.type = ? AND ra.request_id IN (' . implode(',', array_fill(0, count($ids), '?')) . ") ORDER BY FIELD(ra.decision, 'rejected', 'pending', 'approved'), u.name";
+        foreach (q($sql, [$type, ...$ids])->fetchAll() as $v) $out["$type:{$v['request_id']}"][] = $v;
+    }
+    return $out;
+}
+// one line per admin: ✓ approved / ⏳ waiting / ✕ rejected + reason
+function votes_html(array $votes, bool $times = false): string
+{
+    if (!$votes) return '';
+    $n = count($votes);
+    $yes = count(array_filter($votes, fn($v) => $v['decision'] === 'approved'));
+    $no = count(array_filter($votes, fn($v) => $v['decision'] === 'rejected'));
+    $o = '<div class="votes"><div class="votes-sum">🗳 ' . ($yes + $no) . " of $n voted" . ($yes ? " · <span class=\"pos\">$yes yes</span>" : '') . ($no ? " · <span class=\"neg\">$no no</span>" : '') . '</div><ul>';
+    foreach ($votes as $v) {
+        [$icon, $text] = match ($v['decision']) { 'approved' => ['✓', 'approved'], 'rejected' => ['✕', 'rejected'], default => ['⏳', 'waiting'] };
+        $when = $times && $v['decided_at'] ? ' <small>' . h(date('d M, H:i', strtotime($v['decided_at']))) . '</small>' : '';
+        $o .= "<li class=\"v-{$v['decision']}\"><span class=\"vi\">$icon</span><div><b>" . h($v['name']) . "</b> <span class=\"vt\">$text</span>$when"
+            . ($v['decision'] === 'rejected' && $v['reason'] !== null ? '<div class="why">“' . h($v['reason']) . '”</div>' : '') . '</div></li>';
+    }
+    return $o . '</ul></div>';
+}
+function history_html(string $type, int $id): string
+{
+    $rows = q('SELECT l.*, u.name FROM request_log l JOIN users u ON u.id = l.user_id WHERE l.type = ? AND l.request_id = ? ORDER BY l.id DESC', [$type, $id])->fetchAll();
+    if (!$rows) return '';
+    $label = ['sent' => '📨 sent for approval', 'resent' => '🔁 sent again', 'approved' => '✓ approved', 'rejected' => '✕ rejected'];
+    $o = '<ol class="history">';
+    foreach ($rows as $l) {
+        $o .= '<li class="h-' . $l['action'] . '"><b>' . h($l['name']) . '</b> ' . $label[$l['action']] . ' <small>' . h(date('d M Y, H:i', strtotime($l['created_at']))) . '</small>'
+            . ($l['note'] ? '<div class="why">' . h($l['note']) . '</div>' : '') . '</li>';
+    }
+    return $o . '</ol>';
 }
 function pending_for_me(): int
 {
@@ -372,29 +452,34 @@ function requests_for_me(): array
 {
     return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND " . MINE_SQL . " ORDER BY r.created_at", [me()['id']])->fetchAll();
 }
-// one card per request: who / what / how much on the left, amount + decision on the right
-function requests_list(array $rows, callable $date): void
-{ ?>
+// one card per request: who / what / how much, everyone's vote, amount + decision
+function requests_list(array $rows, callable $date, bool $actions = true): void
+{
+    $votes = votes_for($rows); ?>
     <div class="reqs">
     <?php foreach ($rows as $r):
         $link = $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables';
         $days = $r['due_date'] ? (int) round((strtotime($r['due_date']) - strtotime('today')) / 86400) : null; ?>
-      <article class="req <?= $r['type'] ?>">
+      <article class="req <?= $r['type'] ?> s-<?= $r['status'] ?>">
         <div class="req-main">
           <div class="req-top"><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span><?= $r['status'] !== 'pending' ? badge($r['status']) : '' ?></div>
           <a class="req-title" href="<?= $link ?>"><?= h($r['party']) ?></a>
           <div class="req-line"><strong><?= h($r['ref']) ?></strong><?= $r['item'] !== '' ? ' · ' . h($r['item']) : '' ?><?= $r['bill_type'] ? ' · ' . strtoupper($r['bill_type']) . ' bill' : '' ?></div>
           <div class="req-meta">
             <span>👤 <?= h($r['by_name']) ?> · <?= $date($r['created_at']) ?></span>
-            <span>📨 <?= approvers_html($r['approvers']) ?></span>
             <?php if ($days !== null): ?><span class="<?= $days < 0 ? 'neg' : '' ?>">⏰ <?= $days < 0 ? abs($days) . ' days overdue' : ($days === 0 ? 'due today' : 'due ' . $date($r['due_date'])) ?></span><?php endif ?>
             <?php if ($r['files']): ?><a href="<?= $link ?>">📎 <?= (int) $r['files'] ?> file<?= $r['files'] > 1 ? 's' : '' ?></a><?php endif ?>
           </div>
-          <?php if ($r['status'] === 'rejected'): ?><div class="sub neg">Reason: <?= h($r['reject_reason']) ?></div><?php endif ?>
+          <?php $v = $votes["{$r['type']}:{$r['id']}"] ?? []; // one admin, still waiting: nothing new to show
+          if (count($v) > 1 || $r['status'] !== 'pending') echo votes_html($v) ?>
         </div>
         <div class="req-side">
           <div class="req-amt"><?= money($r['amount']) ?></div>
-          <?= can('approve') && $r['status'] === 'pending' ? review_buttons($r['type'], (int) $r['id'], $r['status']) : ($r['status'] === 'pending' ? badge('pending') : '') ?>
+          <?php if (!$actions): // no buttons (e.g. on the send-again page itself)
+                elseif (can_decide($r['type'], (int) $r['id'])): echo review_buttons($r['type'], (int) $r['id'], $r['status']);
+                elseif ($r['status'] === 'rejected' && can('request')): ?>
+            <a role="button" class="resend" href="?p=resend&type=<?= $r['type'] ?>&id=<?= (int) $r['id'] ?>">🔁 Send again</a>
+          <?php endif ?>
         </div>
       </article>
     <?php endforeach ?>
@@ -453,7 +538,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=22">
+<link rel="stylesheet" href="style.css?v=24">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>

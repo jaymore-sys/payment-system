@@ -167,9 +167,12 @@ case 'approvals':
         $back = $type === 'invoice' && str_contains($ref, 'p=payment&') ? "?p=payment&id=$id" : (str_contains($ref, 'p=approvals') ? '?p=approvals' : '?');
         go($back, $msg);
     }
+    $voted = [];
     if (can('approve')) {
         $rows = requests_for_me();
-        $title = 'Waiting for your approval';
+        $voted = q(REQUESTS_SQL . " WHERE r.status = 'pending' AND EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = r.type AND ra.request_id = r.id
+                   AND ra.user_id = ? AND ra.decision <> 'pending') ORDER BY r.created_at", [me()['id']])->fetchAll();
+        $title = 'Waiting for your vote';
     } elseif (can('request')) {
         $rows = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approvers IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
         $title = 'My requests';
@@ -179,6 +182,30 @@ case 'approvals':
     }
     head($title);
     $rows ? requests_list($rows, $date) : print('<div class="panel empty">Nothing here right now. 🎉</div>');
+    if ($voted): ?><h3>🗳 You voted — waiting for others</h3><?php requests_list($voted, $date); endif;
+    foot();
+
+// ── send a rejected request again (administrator) ─────────────────────────
+case 'resend':
+    need('request');
+    $type = enum_in($_GET['type'] ?? '', array_keys(REVIEWABLE));
+    $id = (int) ($_GET['id'] ?? 0);
+    $req = q(REQUESTS_SQL . ' WHERE r.type = ? AND r.id = ?', [$type, $id])->fetch() ?: fail('Request not found', 404);
+    if ($req['status'] !== 'rejected') fail('Only a rejected request can be sent again. This one is ' . $req['status'] . '.');
+    if ($post) {
+        send_request($type, $id, approver_in(), true, trim($_POST['note'] ?? ''));
+        go($type === 'invoice' ? "?p=payment&id=$id" : '?p=approvals', 'Sent again for approval');
+    }
+    head('Send again for approval'); ?>
+    <?php requests_list([$req], $date, false) ?>
+    <form method="post" class="panel"><?= csrf_field() ?>
+      <?= approver_select(approvers_of($type, $id)) ?>
+      <label>Note to the admins <small>(what changed, or your answer to the rejection)</small>
+        <textarea name="note" rows="3" placeholder="e.g. Corrected the amount as per the party's revised bill"></textarea></label>
+      <div class="row"><a href="javascript:history.back()" role="button" class="secondary">Cancel</a><button>🔁 Send again</button></div>
+      <small>Everyone ticked votes again from the start. Earlier votes and reasons stay in the history.</small>
+    </form>
+    <?php if ($hist = history_html($type, $id)): ?><h3>History</h3><div class="panel"><?= $hist ?></div><?php endif;
     foot();
 
 // ── invoice register (list + filters + Excel) ─────────────────────────────
@@ -297,7 +324,7 @@ case 'payment':
                 q("UPDATE payments SET party_id = ?, invoice_no = ?, invoice_date = ?, products = ?, bill_type = ?, amount = ?, due_date = ?, approver_id = ?,
                    status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $id]);
             }
-            set_approvers('invoice', $id, $approvers);
+            send_request('invoice', $id, $approvers, (bool) $pm, $pm ? 'invoice details were edited' : '');
             go("?p=payment&id=$id", 'Saved and sent for approval');
         case 'pay': // record a full or part payment
             need('pay');
@@ -321,6 +348,7 @@ case 'payment':
             foreach (q('SELECT file_path FROM attachments WHERE payment_id = ?', [$id])->fetchAll(PDO::FETCH_COLUMN) as $fp) @unlink(upload_dir() . '/' . basename($fp));
             q('DELETE FROM payments WHERE id = ?', [$id]);
             q("DELETE FROM request_approvers WHERE type = 'invoice' AND request_id = ?", [$id]);
+            q("DELETE FROM request_log WHERE type = 'invoice' AND request_id = ?", [$id]);
             go('?p=payments', "Invoice #$id deleted");
         case 'due':
             if (!$editable) fail('This invoice cannot be edited by you', 403);
@@ -363,8 +391,20 @@ case 'payment':
         $payouts = q('SELECT po.*, u.name FROM payouts po JOIN users u ON u.id = po.created_by WHERE po.payment_id = ? ORDER BY po.paid_on, po.id', [$id])->fetchAll(); ?>
       <p><?= badge($pm['pay_status']) ?> <?= badge($pm['status']) ?> &nbsp; <strong><?= h($pm['party']) ?></strong> · <?= strtoupper($pm['bill_type']) ?> bill
         <?= $pm['invoice_date'] ? ' · dated ' . $date($pm['invoice_date']) : '' ?> · <?= h($pm['products']) ?><br>
-        <small>Added by <?= h($pm['creator']) ?> on <?= $date($pm['created_at']) ?>
-          <?= $pm['approvers'] ? ' · 📨 sent to ' . approvers_html($pm['approvers']) : '' ?><?= $pm['reviewer'] ? ' · last decision by ' . h($pm['reviewer']) : '' ?></small></p>
+        <small>Added by <?= h($pm['creator']) ?> on <?= $date($pm['created_at']) ?></small></p>
+      <?php $votes = votes_for([['type' => 'invoice', 'id' => $id]])["invoice:$id"] ?? [];
+      if ($votes || $pm['status'] !== 'approved'): ?>
+        <section class="panel approval s-<?= $pm['status'] ?>">
+          <div class="approval-head"><strong>🗳 Approval</strong>
+            <span><?= ['pending' => '⏳ Voting in progress', 'approved' => '✅ Approved by everyone', 'rejected' => '❌ Rejected'][$pm['status']] ?></span></div>
+          <?= votes_html($votes, true) ?>
+          <?php if (can_decide('invoice', $id)): ?><div class="your-vote"><strong>Your vote</strong><?= review_buttons('invoice', $id, $pm['status']) ?></div>
+          <?php elseif ($pm['status'] === 'rejected' && can('request')): ?>
+            <a role="button" class="resend" href="?p=resend&type=invoice&id=<?= $id ?>">🔁 Send again for approval</a>
+          <?php endif ?>
+          <?php if ($hist = history_html('invoice', $id)): ?><details class="hist"><summary>History</summary><?= $hist ?></details><?php endif ?>
+        </section>
+      <?php endif ?>
       <div class="stats">
         <article class="stat" data-icon="🧾"><small>Invoice amount</small><div class="big"><?= money($pm['amount']) ?></div></article>
         <article class="stat green" data-icon="💸"><small>Paid</small><div class="big pos"><?= money($pm['paid']) ?></div></article>
@@ -372,12 +412,6 @@ case 'payment':
         <article class="stat <?= $pm['days_overdue'] > 0 ? 'red' : 'blue' ?>" data-icon="📅"><small>Due date</small><div class="big"><?= $date($pm['due_date']) ?></div>
           <?php if ($pm['days_overdue'] > 0): ?><div class="sub neg"><?= (int) $pm['days_overdue'] ?> days overdue</div><?php endif ?></article>
       </div>
-      <?php if ($pm['status'] === 'rejected'): ?><div class="error-box">❌ Rejected: <?= h($pm['reject_reason']) ?></div><?php endif ?>
-      <?php if (can_decide('invoice', $id)): ?>
-        <div class="panel"><strong>Your decision</strong><br><br><?= review_buttons('invoice', $id, $pm['status']) ?></div>
-      <?php elseif ($pm['status'] === 'pending'): ?>
-        <p class="note">⏳ Waiting for approval: <?= approvers_html($pm['approvers']) ?> <small>(all must approve)</small></p>
-      <?php endif ?>
 
       <h3>💸 Payments made</h3>
       <?php if ($payouts): ?>
@@ -508,6 +542,7 @@ case 'receivables':
             need('manage');
             q('DELETE FROM receivables WHERE id = ?', [(int) ($_POST['id'] ?? 0)]);
             q("DELETE FROM request_approvers WHERE type = 'receipt' AND request_id = ?", [(int) ($_POST['id'] ?? 0)]);
+            q("DELETE FROM request_log WHERE type = 'receipt' AND request_id = ?", [(int) ($_POST['id'] ?? 0)]);
             go('?p=receivables', 'Receipt deleted');
         }
         need('request');
@@ -515,7 +550,7 @@ case 'receivables':
                                                      enum_in($_POST['against'] ?? '', ['sales', 'capital']), approver_in()];
         q('INSERT INTO receivables (party_id, amount, received_on, against, note, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)', [
             party_id($party, isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? ''), $amt, $on, $against, trim($_POST['note'] ?? '') ?: null, $approvers[0], me()['id']]);
-        set_approvers('receipt', (int) db()->lastInsertId(), $approvers);
+        send_request('receipt', (int) db()->lastInsertId(), $approvers, false);
         go('?p=receivables', 'Receipt sent for approval');
     }
     $w = ['1=1']; $args = [];
@@ -561,6 +596,7 @@ case 'receivables':
       <tr><td><?= $date($r['received_on']) ?></td><td><?= h($r['party']) ?></td><td><?= $r['gst_registered'] ?><?= $r['gstin'] ? ' <small>' . h($r['gstin']) . '</small>' : '' ?></td>
         <td><?= h(ucfirst($r['against'])) ?></td><td class="right pos"><strong><?= money($r['amount']) ?></strong></td>
         <td><?= badge($r['status']) ?><?= $r['status'] === 'pending' && $r['approvers'] ? '<div class="sub">' . approvers_html($r['approvers']) . '</div>' : '' ?>
+          <?= $r['status'] === 'rejected' && can('request') ? '<div><a href="?p=resend&type=receipt&id=' . (int) $r['id'] . '">🔁 Send again</a></div>' : '' ?>
           <?= $r['status'] === 'rejected' ? '<br><small class="neg">' . h($r['reject_reason']) . '</small>' : '' ?></td><td><?= h($r['note']) ?></td>
         <?php if (can('manage')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this receipt?')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
     <?php endforeach;
