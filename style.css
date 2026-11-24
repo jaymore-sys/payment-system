@@ -208,3 +208,15 @@ dialog article { max-width: 760px; }
   .req .review .rej-form button { width: auto; }
 }
 }
+
+/* ── "send request to" admin chips ─────────────────────────── */
+fieldset.approvers { margin: 0 0 1rem; padding: .6rem .9rem .5rem; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+fieldset.approvers legend { padding: 0 .3rem; font-size: .88rem; font-weight: 700; color: #344054; }
+fieldset.approvers legend small { font-weight: 600; }
+label.chip { position: relative; display: inline-flex; align-items: center; gap: .35rem; margin: .25rem .4rem .25rem 0; padding: .5rem .95rem;
+  border: 1.5px solid var(--line); border-radius: 999px; background: #fff; color: #344054; cursor: pointer; font-weight: 800; user-select: none; }
+label.chip::before { content: '+'; font-weight: 900; color: var(--muted); }
+label.chip input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+label.chip:has(input:checked) { background: var(--brand); border-color: var(--brand); color: #fff; box-shadow: 0 6px 14px rgba(255, 87, 51, .25); }
+label.chip:has(input:checked)::before { content: '✓'; color: #fff; }
+label.chip:has(input:focus-visible) { outline: 3px solid rgba(255, 87, 51, .35); outline-offset: 2px; }

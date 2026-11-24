@@ -116,6 +116,15 @@ const MIGRATIONS = [
         "ALTER TABLE cash_entries ALTER status SET DEFAULT 'approved'",
     ],
     6 => [], // requests view gained party / ref / due date / file count columns (views are rebuilt after any migration)
+    7 => [ // a request can go to several admins; all must approve
+        "CREATE TABLE request_approvers (type ENUM('invoice','receipt') NOT NULL, request_id INT NOT NULL, user_id INT NOT NULL,
+           decision ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending', reason TEXT, decided_at TIMESTAMP NULL,
+           PRIMARY KEY (type, request_id, user_id), FOREIGN KEY (user_id) REFERENCES users(id), INDEX (user_id, decision)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at)
+           SELECT 'invoice', id, approver_id, status, reject_reason, IF(status = 'pending', NULL, NOW()) FROM payments WHERE approver_id IS NOT NULL",
+        "INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at)
+           SELECT 'receipt', id, approver_id, status, reject_reason, IF(status = 'pending', NULL, NOW()) FROM receivables WHERE approver_id IS NOT NULL",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -280,52 +289,88 @@ function product_name(string $n): string
     return $n;
 }
 
-// "Send request to": the admin who must approve. Only that admin can say yes/no.
-function approver_select(?int $current = null): string
+// "Send request to": one or more admins, ticked. ALL of them must approve; one reject rejects.
+function approver_select(array $current = []): string
 {
+    $admins = q("SELECT id, name FROM users WHERE role = 'admin' ORDER BY name")->fetchAll();
+    if (!$admins) return '<p class="neg">No Admin login exists yet. Ask the Developer to create one.</p>';
+    if (!$current && count($admins) === 1) $current = [(int) $admins[0]['id']];
     $o = '';
-    foreach (q("SELECT id, name FROM users WHERE role = 'admin' ORDER BY name")->fetchAll() as $u) {
-        $o .= '<option value="' . $u['id'] . '"' . ($u['id'] == $current ? ' selected' : '') . '>' . h($u['name']) . '</option>';
+    foreach ($admins as $u) {
+        $o .= '<label class="chip"><input type="checkbox" name="approvers[]" value="' . $u['id'] . '"' . (in_array((int) $u['id'], $current, true) ? ' checked' : '') . '> ' . h($u['name']) . '</label>';
     }
-    return $o ? "<label>📨 Send request to<select name=\"approver\" required>$o</select></label>"
-              : '<p class="neg">No Admin login exists yet. Ask the Developer to create one.</p>';
+    return "<fieldset class=\"approvers\"><legend>📨 Send request to <small>(all ticked admins must approve)</small></legend>$o</fieldset>";
 }
-function approver_in(): int
+function approver_in(): array
 {
-    $id = (int) ($_POST['approver'] ?? 0);
-    return q("SELECT 1 FROM users WHERE id = ? AND role = 'admin'", [$id])->fetch() ? $id : fail('Choose which admin to send the request to');
+    $ids = array_values(array_unique(array_map('intval', (array) ($_POST['approvers'] ?? []))));
+    if (!$ids) fail('Tick at least one admin to send the request to');
+    $ok = q('SELECT id FROM users WHERE role = \'admin\' AND id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')', $ids)->fetchAll(PDO::FETCH_COLUMN);
+    if (count($ok) !== count($ids)) fail('One of the chosen people is not an admin');
+    return $ids;
+}
+// (re)send a request: everyone starts at "pending"
+function set_approvers(string $type, int $id, array $ids): void
+{
+    q('DELETE FROM request_approvers WHERE type = ? AND request_id = ?', [$type, $id]);
+    foreach ($ids as $u) q('INSERT INTO request_approvers (type, request_id, user_id) VALUES (?, ?, ?)', [$type, $id, $u]);
+}
+function approvers_of(string $type, int $id): array
+{
+    return array_map('intval', q('SELECT user_id FROM request_approvers WHERE type = ? AND request_id = ?', [$type, $id])->fetchAll(PDO::FETCH_COLUMN));
+}
+// "Asha ✓ · Sumit ⏳" from the view's "Asha:approved|Sumit:pending"
+function approvers_html(?string $list): string
+{
+    if (!$list) return 'any admin';
+    $icon = ['approved' => '<b class="pos">✓</b>', 'rejected' => '<b class="neg">✕</b>', 'pending' => '⏳'];
+    return implode(' · ', array_map(function ($p) use ($icon) {
+        [$name, $d] = explode(':', $p, 2) + [1 => 'pending'];
+        return h($name) . ' ' . ($icon[$d] ?? '');
+    }, explode('|', $list)));
 }
 const REVIEWABLE = ['invoice' => 'payments', 'receipt' => 'receivables'];
-function review(string $type, int $id, bool $approve, string $reason = ''): void
+// mine = I was asked and haven't answered yet, or none of the people asked is an admin any more (role changed)
+const MINE_SQL = "(EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = r.type AND ra.request_id = r.id AND ra.user_id = ? AND ra.decision = 'pending')
+    OR NOT EXISTS (SELECT 1 FROM request_approvers ra JOIN users au ON au.id = ra.user_id WHERE ra.type = r.type AND ra.request_id = r.id AND au.role = 'admin'))";
+function can_decide(string $type, int $id): bool
+{
+    return can('approve') && (bool) q("SELECT 1 FROM requests r WHERE r.type = ? AND r.id = ? AND r.status = 'pending' AND " . MINE_SQL, [$type, $id, me()['id']])->fetch();
+}
+// returns the message to show after the decision
+function review(string $type, int $id, bool $approve, string $reason = ''): string
 {
     need('approve');
     $table = REVIEWABLE[$type] ?? fail('Unknown request type');
-    $r = q("SELECT status, approver_id FROM $table WHERE id = ?", [$id])->fetch() ?: fail('Request not found', 404);
-    if (!approver_free($r['approver_id'] !== null ? (int) $r['approver_id'] : null)) fail('This request was sent to another admin.', 403);
-    if ($approve) {
-        if ($r['status'] === 'approved') fail('Already approved');
-        q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [me()['id'], $id]);
-        return;
+    if (!$approve && $reason === '') fail('Please give a reason for rejecting');
+    $uid = (int) me()['id'];
+    db()->beginTransaction(); // lock the request so two admins answering at once are counted correctly
+    $r = q("SELECT status FROM $table WHERE id = ? FOR UPDATE", [$id])->fetch() ?: fail('Request not found', 404);
+    if ($r['status'] !== 'pending') fail("This request is already {$r['status']}.");
+    if (!can_decide($type, $id)) fail(in_array($uid, approvers_of($type, $id), true) ? 'You have already answered this request.' : 'This request was sent to other admins.', 403);
+    if (!$approve && $type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
+    q("INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at) VALUES (?, ?, ?, ?, ?, NOW())
+       ON DUPLICATE KEY UPDATE decision = VALUES(decision), reason = VALUES(reason), decided_at = NOW()", [$type, $id, $uid, $approve ? 'approved' : 'rejected', $approve ? null : $reason]);
+    if (!$approve) {
+        q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?", [$uid, $reason, $id]);
+        db()->commit();
+        return 'Rejected';
     }
-    if ($reason === '') fail('Please give a reason for rejecting');
-    if ($r['status'] === 'rejected') fail('Already rejected');
-    if ($type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
-    q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?", [me()['id'], $reason, $id]);
-}
-// requests for me, plus any whose chosen approver is no longer an admin (role changed), so nothing gets stuck
-const MINE_SQL = "(approver_id = ? OR approver_id IS NULL OR approver_id NOT IN (SELECT id FROM users WHERE role = 'admin'))";
-function approver_free(?int $approver): bool
-{
-    return !$approver || $approver === (int) me()['id'] || !q("SELECT 1 FROM users WHERE id = ? AND role = 'admin'", [$approver])->fetch();
+    // approved only when every admin asked (who is still an admin) has said yes
+    $waiting = q("SELECT u.name FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+                  WHERE ra.type = ? AND ra.request_id = ? AND ra.decision <> 'approved' AND u.role = 'admin'", [$type, $id])->fetchAll(PDO::FETCH_COLUMN);
+    if (!$waiting) q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [$uid, $id]);
+    db()->commit();
+    return $waiting ? 'Your approval is saved. Still waiting for: ' . implode(', ', $waiting) : 'Approved';
 }
 function pending_for_me(): int
 {
-    return can('approve') ? (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending' AND " . MINE_SQL, [me()['id']])->fetchColumn() : 0;
+    return can('approve') ? (int) q("SELECT COUNT(*) FROM requests r WHERE r.status = 'pending' AND " . MINE_SQL, [me()['id']])->fetchColumn() : 0;
 }
-const REQUESTS_SQL = 'SELECT r.*, u.name AS by_name, v.name AS approver FROM requests r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.approver_id';
+const REQUESTS_SQL = 'SELECT r.*, u.name AS by_name FROM requests r JOIN users u ON u.id = r.created_by';
 function requests_for_me(): array
 {
-    return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND " . str_replace('approver_id', 'r.approver_id', MINE_SQL) . " ORDER BY r.created_at", [me()['id']])->fetchAll();
+    return q(REQUESTS_SQL . " WHERE r.status = 'pending' AND " . MINE_SQL . " ORDER BY r.created_at", [me()['id']])->fetchAll();
 }
 // one card per request: who / what / how much on the left, amount + decision on the right
 function requests_list(array $rows, callable $date): void
@@ -341,7 +386,7 @@ function requests_list(array $rows, callable $date): void
           <div class="req-line"><strong><?= h($r['ref']) ?></strong><?= $r['item'] !== '' ? ' · ' . h($r['item']) : '' ?><?= $r['bill_type'] ? ' · ' . strtoupper($r['bill_type']) . ' bill' : '' ?></div>
           <div class="req-meta">
             <span>👤 <?= h($r['by_name']) ?> · <?= $date($r['created_at']) ?></span>
-            <span>📨 to <?= h($r['approver'] ?? 'any admin') ?></span>
+            <span>📨 <?= approvers_html($r['approvers']) ?></span>
             <?php if ($days !== null): ?><span class="<?= $days < 0 ? 'neg' : '' ?>">⏰ <?= $days < 0 ? abs($days) . ' days overdue' : ($days === 0 ? 'due today' : 'due ' . $date($r['due_date'])) ?></span><?php endif ?>
             <?php if ($r['files']): ?><a href="<?= $link ?>">📎 <?= (int) $r['files'] ?> file<?= $r['files'] > 1 ? 's' : '' ?></a><?php endif ?>
           </div>
@@ -349,7 +394,7 @@ function requests_list(array $rows, callable $date): void
         </div>
         <div class="req-side">
           <div class="req-amt"><?= money($r['amount']) ?></div>
-          <?= can('approve') ? review_buttons($r['type'], (int) $r['id'], $r['status']) : ($r['status'] === 'pending' ? badge('pending') : '') ?>
+          <?= can('approve') && $r['status'] === 'pending' ? review_buttons($r['type'], (int) $r['id'], $r['status']) : ($r['status'] === 'pending' ? badge('pending') : '') ?>
         </div>
       </article>
     <?php endforeach ?>
@@ -408,7 +453,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=20">
+<link rel="stylesheet" href="style.css?v=22">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>

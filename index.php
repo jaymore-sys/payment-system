@@ -162,16 +162,16 @@ case 'approvals':
     if ($post) {
         $type = enum_in($_POST['type'] ?? '', array_keys(REVIEWABLE));
         $id = (int) ($_POST['id'] ?? 0);
-        review($type, $id, $a === 'approve', trim($_POST['reason'] ?? ''));
+        $msg = review($type, $id, $a === 'approve', trim($_POST['reason'] ?? ''));
         $ref = $_SERVER['HTTP_REFERER'] ?? '';
         $back = $type === 'invoice' && str_contains($ref, 'p=payment&') ? "?p=payment&id=$id" : (str_contains($ref, 'p=approvals') ? '?p=approvals' : '?');
-        go($back, $a === 'approve' ? 'Approved' : 'Rejected');
+        go($back, $msg);
     }
     if (can('approve')) {
         $rows = requests_for_me();
         $title = 'Waiting for your approval';
     } elseif (can('request')) {
-        $rows = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approver_id IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
+        $rows = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approvers IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
         $title = 'My requests';
     } else {
         $rows = q(REQUESTS_SQL . " WHERE r.status = 'pending' ORDER BY r.created_at")->fetchAll();
@@ -254,8 +254,8 @@ case 'outstanding':
 // ── one invoice: create / edit / approve / pay (part or full) / follow-up / files / chat ─
 case 'payment':
     $id = (int) ($_GET['id'] ?? 0);
-    $pm = $id ? (q('SELECT r.*, u.name AS creator, v.name AS reviewer, ap.name AS approver FROM payment_register r JOIN users u ON u.id = r.created_by
-                    LEFT JOIN users v ON v.id = r.reviewed_by LEFT JOIN users ap ON ap.id = r.approver_id WHERE r.id = ?', [$id])->fetch() ?: fail('Invoice not found', 404)) : null;
+    $pm = $id ? (q("SELECT r.*, u.name AS creator, v.name AS reviewer, (SELECT approvers FROM requests WHERE type = 'invoice' AND id = r.id) AS approvers
+                    FROM payment_register r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.reviewed_by WHERE r.id = ?", [$id])->fetch() ?: fail('Invoice not found', 404)) : null;
     if (!$pm) need('request');
     // administrator can edit until fully paid; any edit goes back for approval
     $editable = can('request') && (!$pm || $pm['outstanding'] > 0);
@@ -270,7 +270,7 @@ case 'payment':
             if ($pm && paise($amount) < paise($pm['paid'])) fail('Amount cannot be less than what is already paid (' . money($pm['paid']) . ')');
             [$party, $product] = [picked('party'), picked('product')];
             $f = [trim($_POST['invoice_no'] ?? '') ?: null, date_in($_POST['invoice_date'] ?? ''), enum_in($_POST['bill_type'] ?? '', ['gst', 'cash']),
-                  $amount, date_in($_POST['due_date'] ?? ''), approver_in()];
+                  $amount, date_in($_POST['due_date'] ?? ''), ($approvers = approver_in())[0]];
             // same invoice no. already entered for this party? warn (possible double payment), allow "Save anyway"
             if ($f[0] !== null && empty($_POST['dup_ok'])) {
                 $dups = q('SELECT pm.id, pm.invoice_date, pm.amount FROM payments pm JOIN parties p ON p.id = pm.party_id
@@ -282,7 +282,7 @@ case 'payment':
                       <?php foreach ($dups as $d): ?><li><a href="?p=payment&id=<?= $d['id'] ?>" target="_blank">Invoice #<?= $d['id'] ?></a> · <?= $date($d['invoice_date']) ?> · <?= money($d['amount']) ?></li><?php endforeach ?>
                     </ul>
                     <form method="post"><?= csrf_field() ?>
-                      <?php foreach ($_POST as $k => $v) if (is_string($v) && $k !== 'csrf') echo '<input type="hidden" name="' . h($k) . '" value="' . h($v) . '">'; ?>
+                      <?php foreach ($_POST as $k => $v) if ($k !== 'csrf') foreach ((array) $v as $one) echo '<input type="hidden" name="' . h($k) . (is_array($v) ? '[]' : '') . '" value="' . h((string) $one) . '">'; ?>
                       <input type="hidden" name="dup_ok" value="1">
                       <div class="row"><a href="javascript:history.back()" role="button" class="secondary">← Go back and fix</a><button>Save anyway</button></div>
                     </form></div>
@@ -297,6 +297,7 @@ case 'payment':
                 q("UPDATE payments SET party_id = ?, invoice_no = ?, invoice_date = ?, products = ?, bill_type = ?, amount = ?, due_date = ?, approver_id = ?,
                    status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $id]);
             }
+            set_approvers('invoice', $id, $approvers);
             go("?p=payment&id=$id", 'Saved and sent for approval');
         case 'pay': // record a full or part payment
             need('pay');
@@ -319,6 +320,7 @@ case 'payment':
             if (q('SELECT 1 FROM payouts WHERE payment_id = ? AND in_balance', [$id])->fetch()) fail('Payments are recorded against this invoice. Remove them first, then delete the invoice.');
             foreach (q('SELECT file_path FROM attachments WHERE payment_id = ?', [$id])->fetchAll(PDO::FETCH_COLUMN) as $fp) @unlink(upload_dir() . '/' . basename($fp));
             q('DELETE FROM payments WHERE id = ?', [$id]);
+            q("DELETE FROM request_approvers WHERE type = 'invoice' AND request_id = ?", [$id]);
             go('?p=payments', "Invoice #$id deleted");
         case 'due':
             if (!$editable) fail('This invoice cannot be edited by you', 403);
@@ -362,7 +364,7 @@ case 'payment':
       <p><?= badge($pm['pay_status']) ?> <?= badge($pm['status']) ?> &nbsp; <strong><?= h($pm['party']) ?></strong> · <?= strtoupper($pm['bill_type']) ?> bill
         <?= $pm['invoice_date'] ? ' · dated ' . $date($pm['invoice_date']) : '' ?> · <?= h($pm['products']) ?><br>
         <small>Added by <?= h($pm['creator']) ?> on <?= $date($pm['created_at']) ?>
-          <?= $pm['approver'] ? ' · 📨 request sent to <strong>' . h($pm['approver']) . '</strong>' : '' ?><?= $pm['reviewer'] ? ' · reviewed by ' . h($pm['reviewer']) : '' ?></small></p>
+          <?= $pm['approvers'] ? ' · 📨 sent to ' . approvers_html($pm['approvers']) : '' ?><?= $pm['reviewer'] ? ' · last decision by ' . h($pm['reviewer']) : '' ?></small></p>
       <div class="stats">
         <article class="stat" data-icon="🧾"><small>Invoice amount</small><div class="big"><?= money($pm['amount']) ?></div></article>
         <article class="stat green" data-icon="💸"><small>Paid</small><div class="big pos"><?= money($pm['paid']) ?></div></article>
@@ -371,10 +373,10 @@ case 'payment':
           <?php if ($pm['days_overdue'] > 0): ?><div class="sub neg"><?= (int) $pm['days_overdue'] ?> days overdue</div><?php endif ?></article>
       </div>
       <?php if ($pm['status'] === 'rejected'): ?><div class="error-box">❌ Rejected: <?= h($pm['reject_reason']) ?></div><?php endif ?>
-      <?php if (can('approve') && $pm['status'] !== 'approved' && approver_free($pm['approver_id'] ? (int) $pm['approver_id'] : null)): ?>
+      <?php if (can_decide('invoice', $id)): ?>
         <div class="panel"><strong>Your decision</strong><br><br><?= review_buttons('invoice', $id, $pm['status']) ?></div>
       <?php elseif ($pm['status'] === 'pending'): ?>
-        <p class="note">⏳ Waiting for <?= h($pm['approver'] ?? 'an admin') ?> to approve.</p>
+        <p class="note">⏳ Waiting for approval: <?= approvers_html($pm['approvers']) ?> <small>(all must approve)</small></p>
       <?php endif ?>
 
       <h3>💸 Payments made</h3>
@@ -419,7 +421,7 @@ case 'payment':
           <div class="grid">
             <label>Invoice amount (₹)<input name="amount" inputmode="decimal" value="<?= h($pm['amount'] ?? '') ?>" required></label>
             <label>Due date<input type="date" name="due_date" value="<?= h($pm['due_date'] ?? '') ?>" required></label>
-            <?= approver_select($pm['approver_id'] ?? null) ?>
+            <?= approver_select($pm ? approvers_of('invoice', $id) : []) ?>
           </div>
           <?php if ($pm): ?><small>Saving changes sends this invoice back for approval.</small><?php endif ?>
           <button><?= $pm ? 'Save & send for approval' : '📨 Create & send for approval' ?></button>
@@ -505,12 +507,15 @@ case 'receivables':
         if ($a === 'delete') {
             need('manage');
             q('DELETE FROM receivables WHERE id = ?', [(int) ($_POST['id'] ?? 0)]);
+            q("DELETE FROM request_approvers WHERE type = 'receipt' AND request_id = ?", [(int) ($_POST['id'] ?? 0)]);
             go('?p=receivables', 'Receipt deleted');
         }
         need('request');
+        [$party, $amt, $on, $against, $approvers] = [picked('party'), amount_in($_POST['amount'] ?? ''), date_in($_POST['received_on'] ?? ''),
+                                                     enum_in($_POST['against'] ?? '', ['sales', 'capital']), approver_in()];
         q('INSERT INTO receivables (party_id, amount, received_on, against, note, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)', [
-            party_id(picked('party'), isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? ''), amount_in($_POST['amount'] ?? ''), date_in($_POST['received_on'] ?? ''),
-            enum_in($_POST['against'] ?? '', ['sales', 'capital']), trim($_POST['note'] ?? '') ?: null, approver_in(), me()['id']]);
+            party_id($party, isset($_POST['gst']) ? true : null, $_POST['gstin'] ?? ''), $amt, $on, $against, trim($_POST['note'] ?? '') ?: null, $approvers[0], me()['id']]);
+        set_approvers('receipt', (int) db()->lastInsertId(), $approvers);
         go('?p=receivables', 'Receipt sent for approval');
     }
     $w = ['1=1']; $args = [];
@@ -521,8 +526,8 @@ case 'receivables':
     if (in_array($_GET['status'] ?? '', STATUSES, true)) { $w[] = 'r.status = ?'; $args[] = $_GET['status']; }
     if (($s = trim($_GET['party'] ?? '')) !== '') { $w[] = 'p.name LIKE ?'; $args[] = "%$s%"; }
     $rows = q('SELECT r.id, p.name AS party, IF(p.gst_registered, \'Yes\', \'No\') AS gst_registered, p.gstin, r.amount, r.received_on, r.against, r.note, r.status,
-                      r.reject_reason, a.name AS approver
-               FROM receivables r JOIN parties p ON p.id = r.party_id LEFT JOIN users a ON a.id = r.approver_id
+                      r.reject_reason, rq.approvers
+               FROM receivables r JOIN parties p ON p.id = r.party_id LEFT JOIN requests rq ON rq.type = \'receipt\' AND rq.id = r.id
                WHERE ' . implode(' AND ', $w) . ' ORDER BY r.received_on DESC, r.id DESC', $args)->fetchAll();
     if (isset($_GET['csv'])) csv('receipts', $rows);
     $approved = array_filter($rows, fn($r) => $r['status'] === 'approved');
@@ -555,7 +560,7 @@ case 'receivables':
     <?php foreach ($rows as $r): ?>
       <tr><td><?= $date($r['received_on']) ?></td><td><?= h($r['party']) ?></td><td><?= $r['gst_registered'] ?><?= $r['gstin'] ? ' <small>' . h($r['gstin']) . '</small>' : '' ?></td>
         <td><?= h(ucfirst($r['against'])) ?></td><td class="right pos"><strong><?= money($r['amount']) ?></strong></td>
-        <td><?= badge($r['status']) ?><?= $r['status'] === 'pending' && $r['approver'] ? ' <small>→ ' . h($r['approver']) . '</small>' : '' ?>
+        <td><?= badge($r['status']) ?><?= $r['status'] === 'pending' && $r['approvers'] ? '<div class="sub">' . approvers_html($r['approvers']) . '</div>' : '' ?>
           <?= $r['status'] === 'rejected' ? '<br><small class="neg">' . h($r['reject_reason']) . '</small>' : '' ?></td><td><?= h($r['note']) ?></td>
         <?php if (can('manage')): ?><td><form method="post" class="inline" onsubmit="return confirm('Delete this receipt?')"><?= csrf_field() ?><input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $r['id'] ?>"><button class="no">delete</button></form></td><?php endif ?></tr>
     <?php endforeach;

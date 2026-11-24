@@ -9,7 +9,7 @@
 -- Roles (enforced by the app, see can() in app.php):
 --   administrator makes requests, admin approves, superadmin views everything,
 --   developer manages logins. The first registered user becomes developer.
---   Invoices and receipts are requests sent to one admin; only approved ones count. Balance entries need no approval.
+--   Invoices and receipts are requests sent to one or more admins; all must approve. Balance entries need no approval.
 
 SET NAMES utf8mb4;
 
@@ -17,7 +17,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '6');
+INSERT INTO app_meta VALUES ('schema', '7');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -54,7 +54,7 @@ CREATE TABLE payments (
   amount        DECIMAL(14,2) NOT NULL,          -- invoice amount
   due_date      DATE NOT NULL,
   status        ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
-  approver_id   INT,                             -- admin the request was sent to
+  approver_id   INT,                             -- first admin it was sent to (all of them: request_approvers)
   reject_reason TEXT,
   reviewed_by   INT,
   created_by    INT NOT NULL,
@@ -152,6 +152,19 @@ CREATE TABLE attachments (
   FOREIGN KEY (uploaded_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- who an invoice / receipt request was sent to, and each admin's answer; ALL must approve, one reject rejects
+CREATE TABLE request_approvers (
+  type       ENUM('invoice','receipt') NOT NULL,
+  request_id INT NOT NULL,
+  user_id    INT NOT NULL,
+  decision   ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  reason     TEXT,
+  decided_at TIMESTAMP NULL,
+  PRIMARY KEY (type, request_id, user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  INDEX (user_id, decision)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ── views (re-created by the app after every migration) ──────────────────
 
 -- one row per invoice with the same derived columns as the Excel register
@@ -184,10 +197,14 @@ CREATE OR REPLACE VIEW statement AS
 CREATE OR REPLACE VIEW requests AS
   SELECT 'invoice' AS type, pm.id, p.name AS party, COALESCE(NULLIF(pm.invoice_no, ''), CONCAT('#', pm.id)) AS ref,
          pm.products AS item, pm.bill_type, pm.due_date, (SELECT COUNT(*) FROM attachments a WHERE a.payment_id = pm.id) AS files,
+         (SELECT GROUP_CONCAT(CONCAT(u.name, ':', ra.decision) ORDER BY u.name SEPARATOR '|') FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+           WHERE ra.type = 'invoice' AND ra.request_id = pm.id) AS approvers,
          pm.amount, pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
     FROM payments pm JOIN parties p ON p.id = pm.party_id
   UNION ALL
   SELECT 'receipt', r.id, p.name, CONCAT('Against ', r.against), COALESCE(r.note, ''), NULL, NULL, 0,
+         (SELECT GROUP_CONCAT(CONCAT(u.name, ':', ra.decision) ORDER BY u.name SEPARATOR '|') FROM request_approvers ra JOIN users u ON u.id = ra.user_id
+           WHERE ra.type = 'receipt' AND ra.request_id = r.id),
          r.amount, r.status, r.approver_id, r.reject_reason, r.created_by, r.created_at
     FROM receivables r JOIN parties p ON p.id = r.party_id;
 
