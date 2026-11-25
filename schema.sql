@@ -18,7 +18,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '11');
+INSERT INTO app_meta VALUES ('schema', '12');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,

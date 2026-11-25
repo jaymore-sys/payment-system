@@ -173,6 +173,16 @@ const MIGRATIONS = [
            FOREIGN KEY (uploaded_by) REFERENCES users(id), FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE SET NULL,
            FOREIGN KEY (closed_by) REFERENCES users(id), INDEX (closed_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
     ],
+    12 => [ // one-time clean start (asked for 25 Nov 2026): remove all invoices and receipts; balance entries, team chat, photos, names and logins stay
+        "UPDATE inbox SET close_note = 'The invoice was removed when old data was cleared' WHERE payment_id IS NOT NULL",
+        "DELETE FROM request_approvers",
+        "DELETE FROM request_log",
+        "DELETE FROM payouts",
+        "DELETE FROM attachments",
+        "DELETE FROM messages WHERE payment_id IS NOT NULL",
+        "DELETE FROM payments",
+        "DELETE FROM receivables",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
