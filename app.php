@@ -49,7 +49,10 @@ function db(): PDO
     if ($ver < max(array_keys(MIGRATIONS))) {
         foreach (MIGRATIONS as $n => $stmts) {
             if ($n <= $ver) continue;
-            foreach ($stmts as $s) $db->exec($s);
+            foreach ($stmts as $s) {
+                if ($s === 'DELETE UPLOADED FILES') { foreach (glob(upload_dir() . '/*') ?: [] as $f) if (is_file($f)) unlink($f); continue; }
+                $db->exec($s);
+            }
             $db->exec("REPLACE INTO app_meta VALUES ('schema', '$n')");
         }
         foreach (schema_statements() as $s) if (stripos($s, 'CREATE OR REPLACE VIEW') === 0) $db->exec($s);
@@ -182,6 +185,20 @@ const MIGRATIONS = [
         "DELETE FROM messages WHERE payment_id IS NOT NULL",
         "DELETE FROM payments",
         "DELETE FROM receivables",
+    ],
+    13 => [ // one-time full reset (asked for 25 Nov 2026): keep only logins + party and product names
+        "DELETE FROM request_approvers",
+        "DELETE FROM request_log",
+        "DELETE FROM payouts",
+        "DELETE FROM attachments",
+        "DELETE FROM messages",
+        "DELETE FROM inbox",
+        "DELETE FROM payments",
+        "DELETE FROM receivables",
+        "DELETE FROM cash_entries",
+        "DELETE FROM customers",
+        "DELETE FROM sales_people",
+        'DELETE UPLOADED FILES', // invoice copies and photos on disk (handled in db())
     ],
 ];
 
