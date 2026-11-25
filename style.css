@@ -176,38 +176,6 @@ details { margin-top: 1rem; }
 .neg { color: var(--red); } .pos { color: var(--green); } .right { text-align: right; }
 dialog article { max-width: 760px; }
 
-/* ── approval cards ────────────────────────────────────────── */
-.reqs { display: grid; gap: .8rem; margin-bottom: 1rem; }
-.req { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .8rem 1.5rem; align-items: center;
-  padding: 1rem 1.2rem; border-left: 4px solid var(--brand); }
-.req.receipt { border-left-color: var(--green); }
-.req-top { display: flex; gap: .4rem; margin-bottom: .35rem; }
-.req-title { font-size: 1.08rem; font-weight: 900; color: var(--ink); text-decoration: none; }
-.req-title:hover { color: var(--brand); }
-.req-line { margin-top: .15rem; color: #344054; overflow-wrap: anywhere; }
-.req-meta { display: flex; flex-wrap: wrap; gap: .3rem 1.1rem; margin-top: .5rem; font-size: .82rem; font-weight: 600; color: var(--muted); }
-.req-meta .neg { color: var(--red); }
-.req-side { display: flex; flex-direction: column; align-items: flex-end; gap: .6rem; }
-.req-amt { font-size: 1.4rem; font-weight: 900; white-space: nowrap; }
-.review { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: flex-start; gap: .5rem; }
-.review form.inline button, .review > button.no { display: inline-flex; align-items: center; justify-content: center; height: 2.6rem; padding: 0 1.1rem; font-size: .92rem; line-height: 1; }
-.review > button.no { margin: 0; width: auto; }
-.review .rej-form { flex-basis: 100%; display: flex; }
-.review .rej-form[hidden] { display: none; }
-.review .rej-form input { flex: 1 1 auto; min-width: 0; height: 2.6rem; }
-.review .rej-form button { height: 2.6rem; white-space: nowrap; }
-.panel .review { justify-content: flex-start; }
-@media (max-width: 700px) {
-  .req { grid-template-columns: minmax(0, 1fr); padding: .9rem 1rem; }
-  .req-side { flex-direction: column; align-items: stretch; gap: .6rem; border-top: 1px dashed var(--line); padding-top: .7rem; }
-  .req-amt { font-size: 1.5rem; }
-  .req-side > .badge { align-self: flex-start; }
-  .req .review { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
-  .req .review > form, .req .review > form button, .req .review > button { width: 100%; }
-  .req .review .rej-form { grid-column: 1 / -1; }
-  .req .review .rej-form button { width: auto; }
-}
-
 /* ── "send request to" admin chips ─────────────────────────── */
 fieldset.approvers { margin: 0 0 1rem; padding: .6rem .9rem .5rem; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 fieldset.approvers legend { padding: 0 .3rem; font-size: .88rem; font-weight: 700; color: #344054; }
@@ -238,9 +206,6 @@ label.chip:has(input:focus-visible) { outline: 3px solid rgba(255, 87, 51, .35);
 .your-vote { display: grid; gap: .5rem; margin-top: .9rem; padding-top: .8rem; border-top: 1px dashed var(--line); }
 a.resend { display: inline-flex; align-items: center; justify-content: center; margin-top: .8rem; padding: .6rem 1.1rem; border: 0;
   border-radius: 12px; background: var(--brand); color: #fff; font-weight: 800; text-decoration: none; }
-.req a.resend { margin-top: 0; }
-.req.s-rejected { border-left-color: var(--red); }
-.req.s-approved { border-left-color: var(--green); }
 details.hist { margin-top: .9rem; }
 details.hist > summary { font-size: .88rem; color: var(--muted) !important; }
 .history { display: grid; gap: .65rem; margin: .5rem 0 0; padding: 0 0 0 1rem; border-left: 2px solid var(--line); list-style: none; }
@@ -304,7 +269,8 @@ fieldset.paymode:has(input[value=full]:checked) .part-amt { display: none; }
 
 .stat, .req, article.flush, .panel { transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease; }
 @media (hover: hover) {
-  .stat:hover, .req:hover { transform: translateY(-3px); box-shadow: 0 14px 30px rgba(15, 23, 42, .09); }
+  .req:hover { box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
+  .stat:hover { transform: translateY(-3px); box-shadow: 0 14px 30px rgba(15, 23, 42, .09); }
   .stat:hover::before { transform: translateY(-50%) scale(1.1) rotate(-6deg); }
   .side nav a:hover .ico { transform: translateX(3px) scale(1.12); }
   .tbl tbody tr { transition: background .15s; } .tbl tbody tr:hover td { background: var(--brand-soft); }
@@ -344,22 +310,6 @@ body.auth::after { bottom: -30vmax; right: -20vmax; background: radial-gradient(
   @view-transition { navigation: none; }
 }
 
-/* ── compact approval tiles: two or three per row on wide screens ── */
-button, [role=button] { white-space: nowrap; }
-@media (min-width: 701px) {
-  .reqs { grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); align-items: start; }
-  .req { grid-template-columns: minmax(0, 1fr); gap: .6rem; padding: .85rem 1rem; }
-  .req-title { font-size: 1rem; }
-  .req-line { font-size: .92rem; }
-  .req-meta { margin-top: .35rem; font-size: .78rem; }
-  .req .votes { margin-top: .5rem; padding: .45rem .6rem; }
-  .req .votes li { font-size: .84rem; }
-  .req-side { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem;
-    border-top: 1px dashed var(--line); padding-top: .6rem; }
-  .req-amt { font-size: 1.2rem; }
-  .req .review form.inline button, .req .review > button.no, .req a.resend { height: 2.3rem; padding: 0 .9rem; font-size: .86rem; }
-}
-
 /* ── invoice photos (User → Administrator) ── */
 .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: .9rem; margin-bottom: 1rem; }
 .photo { margin: 0; padding: 0; overflow: hidden; display: flex; flex-direction: column; animation: rise .45s cubic-bezier(.2, .7, .2, 1) backwards; }
@@ -387,3 +337,75 @@ a.alert-link { display: block; margin-bottom: 1rem; padding: .8rem 1rem; border-
   border: 1px solid #bae6fd; text-decoration: none; font-weight: 600; animation: toast .4s ease backwards; }
 a.alert-link:hover { background: #bae6fd; }
 .photo-body .badge { text-transform: none; }
+
+/* ── approval requests: one clean row each — what · votes · amount + action ── */
+nav.tabs { display: flex; justify-content: flex-start; gap: .4rem; margin: 0 0 1rem; overflow-x: auto; scrollbar-width: none; }
+nav.tabs a { flex: none; margin: 0; display: inline-flex; align-items: center; gap: .45rem; padding: .45rem .9rem; border: 1px solid var(--line); border-radius: 999px;
+  background: #fff; color: #344054; font-weight: 700; font-size: .88rem; text-decoration: none; transition: background .2s, border-color .2s, color .2s; }
+.tabs a b { min-width: 1.4rem; padding: 0 .35rem; border-radius: 999px; background: #f1f5f9; font-size: .75rem; text-align: center; }
+.tabs a:hover { border-color: var(--brand-line); background: var(--brand-soft); }
+.tabs a.on { background: var(--ink); border-color: var(--ink); color: #fff; } .tabs a.on b { background: rgba(255, 255, 255, .2); }
+.reqs { display: grid; gap: .65rem; margin-bottom: 1.2rem; }
+.req { position: relative; margin: 0; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) 210px; align-items: center; gap: 1.4rem;
+  padding: .9rem 1.2rem .9rem 1.4rem; overflow: hidden; }
+.req::before { content: ''; position: absolute; inset: 0 auto 0 0; width: 5px; background: #f59e0b; }
+.req.s-approved::before { background: var(--green); } .req.s-rejected::before { background: var(--red); }
+.req-head { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .6rem; }
+.req-title { font-size: 1.02rem; font-weight: 800; color: var(--ink); text-decoration: none; }
+.req-title:hover { color: var(--brand); }
+.st { padding: .12rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 800; white-space: nowrap; background: #fef3c7; color: #92400e; }
+.st-approved { background: #dcfce7; color: #166534; } .st-rejected { background: #fee2e2; color: #991b1b; }
+.req-line { margin-top: .2rem; font-size: .9rem; color: #344054; overflow-wrap: anywhere; }
+.req-meta { display: flex; flex-wrap: wrap; gap: .2rem 1rem; margin-top: .35rem; font-size: .78rem; font-weight: 600; color: var(--muted); }
+.req-meta .neg { color: var(--red); }
+.req-votes { min-width: 0; }
+.req-votes .votes-sum { margin-bottom: .35rem; font-size: .75rem; font-weight: 800; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+.vchips { display: flex; flex-wrap: wrap; gap: .3rem; }
+.vchip { display: inline-flex; align-items: center; gap: .3rem; padding: .2rem .6rem; border-radius: 999px; font-size: .8rem; font-weight: 700;
+  background: #f1f5f9; color: #475467; white-space: nowrap; }
+.vchip.v-approved { background: #dcfce7; color: #166534; } .vchip.v-rejected { background: #fee2e2; color: #991b1b; }
+.req-votes .why { margin-top: .4rem; font-size: .82rem; }
+.req-side { display: flex; flex-direction: column; align-items: flex-end; gap: .5rem; text-align: right; }
+.req-amt { font-size: 1.25rem; font-weight: 900; white-space: nowrap; }
+.req-amt .part-of { display: block; font-size: .72rem; font-weight: 700; color: var(--muted); }
+.req .resend, .review form.inline button, .review > button.no { display: inline-flex; align-items: center; justify-content: center; margin: 0;
+  height: 2.3rem; padding: 0 .95rem; font-size: .86rem; line-height: 1; }
+.review { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
+.review form.inline { margin: 0; }
+.review .rej-form { flex-basis: 100%; display: flex; gap: .4rem; }
+.review .rej-form[hidden] { display: none; }
+.review .rej-form input { flex: 1 1 auto; min-width: 0; height: 2.3rem; margin: 0; }
+.review .rej-form button { white-space: nowrap; }
+.panel .review { justify-content: flex-start; }
+@media (max-width: 1100px) {
+  .req { grid-template-columns: minmax(0, 1fr) 200px; }
+  .req-votes { grid-column: 1; grid-row: 2; }
+  .req-side { grid-column: 2; grid-row: 1 / span 2; }
+}
+@media (max-width: 700px) {
+  .req { grid-template-columns: minmax(0, 1fr); gap: .7rem; padding: .85rem .95rem .85rem 1.15rem; }
+  .req-votes, .req-side { grid-column: 1; grid-row: auto; }
+  .req-side { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; text-align: left;
+    border-top: 1px dashed var(--line); padding-top: .65rem; }
+  .req-amt .part-of { text-align: left; }
+  .req .review { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
+  .req .review > form, .req .review > form button, .req .review > button { width: 100%; }
+  .req .review .rej-form { grid-column: 1 / -1; }
+  .req .review .rej-form button { width: auto; }
+  .req .resend { flex: 1 1 100%; }
+}
+
+/* one-page logins (User, Developer): top bar with name + logout, no menu */
+body.app.solo { display: block; background: var(--bg); }
+body.app.solo > .topbar { display: flex; align-items: center; gap: .7rem; position: sticky; top: 0; z-index: 10; padding: .65rem max(1rem, calc((100% - 1000px) / 2));
+  background: #fff; border-bottom: 1px solid var(--line); }
+body.solo .topbar img { width: 120px; }
+body.solo .topbar strong { color: var(--brand); font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; }
+body.solo .who { display: flex; align-items: center; gap: .5rem; margin-left: auto; line-height: 1.15; }
+body.solo .who b { display: block; font-size: .9rem; } body.solo .who small { color: var(--muted); font-size: .75rem; font-weight: 700; }
+body.solo .topbar .logout { padding: .45rem .8rem; border-radius: 10px; font-size: .85rem; }
+body.solo .content { max-width: 1000px; margin: 0 auto; }
+@media (max-width: 520px) {
+  body.solo .topbar strong, body.solo .who > span:last-child { display: none; }
+  body.solo .topbar img { width: 104px; }
+}

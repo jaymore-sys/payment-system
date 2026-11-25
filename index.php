@@ -178,14 +178,22 @@ case 'approvals':
         $voted = q(REQUESTS_SQL . " WHERE r.status = 'pending' AND EXISTS (SELECT 1 FROM request_approvers ra WHERE ra.type = r.type AND ra.request_id = r.id
                    AND ra.user_id = ? AND ra.decision <> 'pending') ORDER BY r.created_at", [me()['id']])->fetchAll();
         $title = 'Waiting for your vote';
-    } elseif (can('request')) {
-        $rows = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approvers IS NOT NULL ORDER BY r.status = 'pending' DESC, r.created_at DESC LIMIT 200", [me()['id']])->fetchAll();
+    } elseif (can('request')) { // tabs: everything / waiting / rejected / approved; rejected first, they need action
+        $all = q(REQUESTS_SQL . " WHERE r.created_by = ? AND r.approvers IS NOT NULL ORDER BY FIELD(r.status, 'rejected', 'pending', 'approved'), r.created_at DESC LIMIT 300", [me()['id']])->fetchAll();
+        $tab = enum_in($_GET['s'] ?? 'all', ['all', 'pending', 'rejected', 'approved']);
+        $rows = $tab === 'all' ? $all : array_values(array_filter($all, fn($r) => $r['status'] === $tab));
         $title = 'My requests';
     } else {
         $rows = q(REQUESTS_SQL . " WHERE r.status = 'pending' ORDER BY r.created_at")->fetchAll();
         $title = 'Pending approvals';
     }
     head($title);
+    if (isset($all)): $n = array_count_values(array_column($all, 'status')); ?>
+      <nav class="tabs">
+      <?php foreach (['all' => ['All', count($all)], 'pending' => ['⏳ Waiting', $n['pending'] ?? 0], 'rejected' => ['✕ Rejected', $n['rejected'] ?? 0], 'approved' => ['✓ Approved', $n['approved'] ?? 0]] as $k => [$l, $c]): ?>
+        <a href="?p=approvals&s=<?= $k ?>" class="<?= $k === $tab ? 'on' : '' ?> t-<?= $k ?>"><?= $l ?> <b><?= $c ?></b></a>
+      <?php endforeach ?></nav>
+    <?php endif;
     $rows ? requests_list($rows, $date) : print('<div class="panel empty">Nothing here right now. 🎉</div>');
     if ($voted): ?><h3>🗳 You voted — waiting for others</h3><?php requests_list($voted, $date); endif;
     foot();

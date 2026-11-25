@@ -569,23 +569,31 @@ function requests_for_me(): array
 // one card per request: who / what / how much, everyone's vote, amount + decision
 function requests_list(array $rows, callable $date, bool $actions = true): void
 {
-    $votes = votes_for($rows); ?>
+    $votes = votes_for($rows);
+    $label = ['pending' => '⏳ Waiting', 'approved' => '✓ Approved', 'rejected' => '✕ Rejected']; ?>
     <div class="reqs">
     <?php foreach ($rows as $r):
         $link = $r['type'] === 'invoice' ? "?p=payment&id={$r['id']}" : '?p=receivables';
-        $days = $r['due_date'] ? (int) round((strtotime($r['due_date']) - strtotime('today')) / 86400) : null; ?>
-      <article class="req <?= $r['type'] ?> s-<?= $r['status'] ?>">
+        $days = $r['due_date'] ? (int) round((strtotime($r['due_date']) - strtotime('today')) / 86400) : null;
+        $v = $votes["{$r['type']}:{$r['id']}"] ?? [];
+        $yes = count(array_filter($v, fn($x) => $x['decision'] === 'approved'));
+        $no = count(array_filter($v, fn($x) => $x['decision'] === 'rejected')); ?>
+      <article class="req s-<?= $r['status'] ?>">
         <div class="req-main">
-          <div class="req-top"><span class="badge type-<?= $r['type'] ?>"><?= $r['type'] ?></span><?= $r['status'] !== 'pending' ? badge($r['status']) : '' ?></div>
-          <a class="req-title" href="<?= $link ?>"><?= h($r['party']) ?></a>
+          <div class="req-head"><a class="req-title" href="<?= $link ?>"><?= h($r['party']) ?></a><span class="st st-<?= $r['status'] ?>"><?= $label[$r['status']] ?? h($r['status']) ?></span></div>
           <div class="req-line"><strong><?= h($r['ref']) ?></strong><?= $r['item'] !== '' ? ' · ' . h($r['item']) : '' ?><?= $r['bill_type'] ? ' · ' . strtoupper($r['bill_type']) . ' bill' : '' ?></div>
           <div class="req-meta">
             <span>👤 <?= h($r['by_name']) ?> · <?= $date($r['created_at']) ?></span>
             <?php if ($days !== null): ?><span class="<?= $days < 0 ? 'neg' : '' ?>">⏰ <?= $days < 0 ? abs($days) . ' days overdue' : ($days === 0 ? 'due today' : 'due ' . $date($r['due_date'])) ?></span><?php endif ?>
             <?php if ($r['files']): ?><a href="<?= $link ?>">📎 <?= (int) $r['files'] ?> file<?= $r['files'] > 1 ? 's' : '' ?></a><?php endif ?>
           </div>
-          <?php $v = $votes["{$r['type']}:{$r['id']}"] ?? []; // one admin, still waiting: nothing new to show
-          if (count($v) > 1 || $r['status'] !== 'pending') echo votes_html($v) ?>
+        </div>
+        <div class="req-votes">
+          <div class="votes-sum"><?= $yes + $no ?> of <?= count($v) ?> voted<?= $yes ? " · <span class=\"pos\">$yes yes</span>" : '' ?><?= $no ? " · <span class=\"neg\">$no no</span>" : '' ?></div>
+          <div class="vchips"><?php foreach ($v as $x): ?><span class="vchip v-<?= $x['decision'] ?>" title="<?= h($x['name']) ?>: <?= $x['decision'] === 'pending' ? 'waiting' : $x['decision'] ?>"><?= ['approved' => '✓', 'rejected' => '✕'][$x['decision']] ?? '⏳' ?> <?= h($x['name']) ?></span><?php endforeach ?></div>
+          <?php foreach ($v as $x) if ($x['decision'] === 'rejected' && $x['reason'] !== null): ?>
+            <div class="why"><b><?= h(explode(' ', $x['name'])[0]) ?>:</b> “<?= h($x['reason']) ?>”</div>
+          <?php endif ?>
         </div>
         <div class="req-side">
           <div class="req-amt"><?= money($r['amount']) ?><?= isset($r['invoice_amount']) && paise($r['amount']) < paise($r['invoice_amount'])
@@ -655,10 +663,16 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=27">
+<link rel="stylesheet" href="style.css?v=29">
 </head>
-<body class="<?= $u ? 'app' : 'auth' ?>">
-<?php if ($u): ?>
+<?php $solo = $u && count(array_filter($nav, fn($n) => can($n[3]))) <= 1; // one-page logins (User, Developer): no menu, just a top bar ?>
+<body class="<?= $u ? 'app' : 'auth' ?><?= $solo ? ' solo' : '' ?>">
+<?php if ($solo): ?>
+<header class="topbar"><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><strong>Payment Desk</strong>
+  <span class="who"><span class="avatar"><?= h(mb_strtoupper(mb_substr($u['name'], 0, 1))) ?></span><span><b><?= h($u['name']) ?></b><small><?= h(ucfirst($u['role'])) ?></small></span></span>
+  <a class="logout" href="?p=logout">⏻ Logout</a></header>
+<main class="content">
+<?php elseif ($u): ?>
 <input type="checkbox" id="nav-toggle" hidden>
 <aside class="side">
   <a class="brand" href="?"><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><small>Payment Desk</small></a>
