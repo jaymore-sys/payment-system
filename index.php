@@ -139,7 +139,7 @@ case 'home':
             <tr><td>Total outstanding</td><td class="right"><strong><?= money($t['outstanding']) ?></strong></td></tr>
             <tr><td>Invoices with balance</td><td class="right"><?= $t['with_balance'] ?></td></tr>
             <tr><td>Fully paid invoices</td><td class="right"><?= $t['fully_paid'] ?></td></tr>
-            <?php [$rc, $ra] = q("SELECT COUNT(*), COALESCE(SUM(outstanding), 0) FROM payment_register WHERE status = 'approved' AND outstanding > 0")->fetch(PDO::FETCH_NUM); ?>
+            <?php [$rc, $ra] = q('SELECT COUNT(*), COALESCE(SUM(payable), 0) FROM payment_register WHERE payable > 0')->fetch(PDO::FETCH_NUM); ?>
             <tr><td><a href="?p=payments&pay=ready">💸 Approved, ready to pay (<?= (int) $rc ?>)</a></td><td class="right"><strong><?= money($ra) ?></strong></td></tr>
             <tr><td>Paid this month</td><td class="right neg"><?= money($mon['paid']) ?></td></tr>
             <tr><td>Received this month</td><td class="right pos"><?= money($mon['received']) ?></td></tr>
@@ -194,13 +194,19 @@ case 'resend':
     $id = (int) ($_GET['id'] ?? 0);
     $req = q(REQUESTS_SQL . ' WHERE r.type = ? AND r.id = ?', [$type, $id])->fetch() ?: fail('Request not found', 404);
     if ($req['status'] !== 'rejected') fail('Only a rejected request can be sent again. This one is ' . $req['status'] . '.');
+    $inv = q('SELECT amount, approved_amount, request_amount FROM payments WHERE id = ?', [$id])->fetch();
+    $max = number_format((paise($inv['amount']) - paise($inv['approved_amount'])) / 100, 2, '.', '');
     if ($post) {
-        send_request($type, $id, approver_in(), true, trim($_POST['note'] ?? ''));
+        $req = request_in($max);
+        $approvers = approver_in();
+        q('UPDATE payments SET request_amount = ? WHERE id = ?', [$req, $id]);
+        send_request($type, $id, $approvers, true, pay_text($req, $inv['amount']) . (trim($_POST['note'] ?? '') !== '' ? ' — ' . trim($_POST['note']) : ''));
         go($type === 'invoice' ? "?p=payment&id=$id" : '?p=approvals', 'Sent again for approval');
     }
     head('Send again for approval'); ?>
     <?php requests_list([$req], $date, false) ?>
     <form method="post" class="panel"><?= csrf_field() ?>
+      <?= pay_mode_html($max, $inv['request_amount']) ?>
       <?= approver_select(approvers_of($type, $id)) ?>
       <label>Note to the admins <small>(what changed, or your answer to the rejection)</small>
         <textarea name="note" rows="3" placeholder="e.g. Corrected the amount as per the party's revised bill"></textarea></label>
@@ -218,7 +224,7 @@ case 'payments':
     if ($d = date_or_null($_GET['to'] ?? ''))   { $w[] = "$by <= ?"; $args[] = $d; $desc[] = "$by to $d"; }
     if (in_array($_GET['status'] ?? '', STATUSES, true)) { $w[] = 'status = ?'; $args[] = $_GET['status']; $desc[] = $_GET['status']; }
     if (in_array($_GET['pay'] ?? '', PAY_STATES, true)) { $w[] = 'pay_status = ?'; $args[] = $_GET['pay']; $desc[] = $_GET['pay']; }
-    if (($_GET['pay'] ?? '') === 'ready') { $w[] = "status = 'approved' AND outstanding > 0"; $desc[] = 'ready to pay'; }
+    if (($_GET['pay'] ?? '') === 'ready') { $w[] = 'payable > 0'; $desc[] = 'ready to pay'; }
     if (in_array($_GET['bill'] ?? '', ['gst', 'cash'], true)) { $w[] = 'bill_type = ?'; $args[] = $_GET['bill']; $desc[] = strtoupper($_GET['bill']) . ' bills'; }
     if (($s = trim($_GET['party'] ?? '')) !== '') { $w[] = 'party LIKE ?'; $args[] = "%$s%"; $desc[] = "party: $s"; }
     if (($s = trim($_GET['product'] ?? '')) !== '') { $w[] = 'products = ?'; $args[] = $s; $desc[] = "product: $s"; }
@@ -259,7 +265,7 @@ case 'payments':
         <td class="right"><?= money($r['amount']) ?></td><td class="right pos"><?= money($r['paid']) ?></td><td class="right"><strong><?= money($r['outstanding']) ?></strong></td>
         <td><?= $date($r['due_date']) ?><?= $r['days_overdue'] > 0 ? '<div class="sub neg">' . (int) $r['days_overdue'] . ' days overdue</div>' : '' ?></td>
         <td><?= badge($r['pay_status']) ?><?= $r['status'] !== 'approved' ? ' ' . badge($r['status']) : '' ?>
-          <?= $r['status'] === 'approved' && $r['outstanding'] > 0 && can('pay') ? '<a class="pay-btn" href="?p=payment&id=' . $r['id'] . '#pay">💸 Pay</a>' : '' ?></td>
+          <?= $r['payable'] > 0 && can('pay') ? '<a class="pay-btn" href="?p=payment&id=' . $r['id'] . '#pay">💸 Pay</a>' : '' ?></td>
         <td class="wrap"><?= h(mb_strimwidth($r['products'], 0, 32, '…')) ?></td></tr>
     <?php endforeach;
     if (!$rows): ?><tr><td colspan="8" class="empty">No invoices match.</td></tr><?php endif ?></tbody>
@@ -322,29 +328,40 @@ case 'payment':
                     <?php foot();
                 }
             }
+            // full or part: new invoice → up to the amount; edited → up to what is not paid yet (unpaid approvals are asked again)
+            $req = request_in(number_format((paise($amount) - paise($pm['paid'] ?? 0)) / 100, 2, '.', ''));
             $f = [party_id($party), $f[0], $f[1], product_name($product), ...array_slice($f, 2)]; // names saved only once everything is valid
             if (!$pm) {
-                q('INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, due_date, approver_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [...$f, $uid]);
+                q('INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, due_date, approver_id, request_amount, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [...$f, $req, $uid]);
                 $id = (int) db()->lastInsertId();
             } else {
                 q("UPDATE payments SET party_id = ?, invoice_no = ?, invoice_date = ?, products = ?, bill_type = ?, amount = ?, due_date = ?, approver_id = ?,
-                   status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $id]);
+                   request_amount = ?, approved_amount = ?, status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $req, $pm['paid'], $id]);
             }
             save_uploads($id, $files);
-            send_request('invoice', $id, $approvers, (bool) $pm, $pm ? 'invoice details were edited' : '');
+            send_request('invoice', $id, $approvers, (bool) $pm, pay_text($req, $amount) . ($pm ? ' — invoice details were edited' : ''));
             go("?p=payment&id=$id", 'Saved and sent for approval');
         case 'pay': // record a full or part payment
             need('pay');
             $amt = amount_in($_POST['amount'] ?? '');
             $on = date_in($_POST['paid_on'] ?? '');
             db()->beginTransaction(); // lock the invoice so two clicks can't overpay it
-            $inv = q('SELECT status, amount FROM payments WHERE id = ? FOR UPDATE', [$id])->fetch();
+            $inv = q('SELECT approved_amount FROM payments WHERE id = ? FOR UPDATE', [$id])->fetch();
             $paid = q('SELECT COALESCE(SUM(amount), 0) FROM payouts WHERE payment_id = ?', [$id])->fetchColumn();
-            if ($inv['status'] !== 'approved') fail('The invoice must be approved before paying.');
-            if (paise($paid) + paise($amt) > paise($inv['amount'])) fail('That is more than the outstanding ' . money((paise($inv['amount']) - paise($paid)) / 100) . '.');
+            $left = paise($inv['approved_amount']) - paise($paid);
+            if ($left <= 0) fail('Nothing is approved to pay right now. Request the next part first.');
+            if (paise($amt) > $left) fail('That is more than the approved amount still to pay (' . money($left / 100) . ').');
             q('INSERT INTO payouts (payment_id, amount, paid_on, note, created_by) VALUES (?, ?, ?, ?, ?)', [$id, $amt, $on, trim($_POST['note'] ?? '') ?: null, $uid]);
             db()->commit();
             break;
+        case 'next':
+            need('request');
+            if ($pm['status'] === 'pending') fail('A request for this invoice is already waiting for votes.');
+            $req = request_in(number_format((paise($pm['amount']) - paise($pm['approved_amount'])) / 100, 2, '.', ''));
+            $approvers = approver_in();
+            q('UPDATE payments SET request_amount = ? WHERE id = ?', [$req, $id]);
+            send_request('invoice', $id, $approvers, true, 'next ' . pay_text($req, $pm['amount']) . (trim($_POST['note'] ?? '') !== '' ? ' — ' . trim($_POST['note']) : ''));
+            go("?p=payment&id=$id", 'Next part sent for approval');
         case 'unpay':
             need('manage');
             q('DELETE FROM payouts WHERE id = ? AND payment_id = ?', [(int) ($_POST['payout'] ?? 0), $id])->rowCount() ?: fail('Payment not found', 404);
@@ -394,7 +411,7 @@ case 'payment':
       <?php $votes = votes_for([['type' => 'invoice', 'id' => $id]])["invoice:$id"] ?? [];
       if ($votes || $pm['status'] !== 'approved'): ?>
         <section class="panel approval s-<?= $pm['status'] ?>">
-          <div class="approval-head"><strong>🗳 Approval</strong>
+          <div class="approval-head"><strong>🗳 Approval · <?= ucfirst(pay_text($pm['request_amount'] ?? $pm['amount'], $pm['amount'])) ?></strong>
             <span><?= ['pending' => '⏳ Voting in progress', 'approved' => '✅ Approved by everyone', 'rejected' => '❌ Rejected'][$pm['status']] ?></span></div>
           <?= votes_html($votes, true) ?>
           <?php if (can_decide('invoice', $id)): ?><div class="your-vote"><strong>Your vote</strong><?= review_buttons('invoice', $id, $pm['status']) ?></div>
@@ -406,6 +423,8 @@ case 'payment':
       <?php endif ?>
       <div class="stats">
         <article class="stat" data-icon="🧾"><small>Invoice amount</small><div class="big"><?= money($pm['amount']) ?></div></article>
+        <article class="stat blue" data-icon="✅"><small>Approved to pay</small><div class="big"><?= money($pm['approved_amount']) ?></div>
+          <?php if ($pm['payable'] > 0): ?><div class="sub pos"><?= money($pm['payable']) ?> ready to pay</div><?php endif ?></article>
         <article class="stat green" data-icon="💸"><small>Paid</small><div class="big pos"><?= money($pm['paid']) ?></div></article>
         <article class="stat" data-icon="📌"><small>Outstanding</small><div class="big <?= $pm['outstanding'] > 0 ? 'neg' : '' ?>"><?= money($pm['outstanding']) ?></div></article>
         <article class="stat <?= $pm['days_overdue'] > 0 ? 'red' : 'blue' ?>" data-icon="📅"><small>Due date</small><div class="big"><?= $date($pm['due_date']) ?></div>
@@ -422,17 +441,27 @@ case 'payment':
               <input type="hidden" name="a" value="unpay"><input type="hidden" name="payout" value="<?= $po['id'] ?>"><button class="no">remove</button></form></td><?php endif ?></tr>
         <?php endforeach ?></tbody></table></div>
       <?php else: ?><p><small>No payments yet.</small></p><?php endif ?>
-      <?php if ($pm['outstanding'] > 0 && can('pay') && $pm['status'] === 'approved'): ?>
+      <?php if ($pm['payable'] > 0 && can('pay')): ?>
         <form method="post" class="panel" id="pay"><?= csrf_field() ?><input type="hidden" name="a" value="pay">
-          <strong>💸 Record payment</strong> <small>— pay the full outstanding or any part of it</small><br><br>
+          <strong>💸 Record payment</strong> <small>— <?= money($pm['payable']) ?> approved and not paid yet; pay all of it or a part</small><br><br>
           <div class="grid">
-            <label>Amount (₹) — full or part<input name="amount" inputmode="decimal" value="<?= h($pm['outstanding']) ?>" required></label>
+            <label>Amount (₹) — full or part<input name="amount" inputmode="decimal" value="<?= h($pm['payable']) ?>" required></label>
             <label>Paid on<input type="date" name="paid_on" value="<?= date('Y-m-d') ?>" required></label>
             <label>Note<input name="note" placeholder="e.g. NEFT ref / cheque no."></label>
           </div>
           <button>💸 Record payment</button></form>
       <?php endif ?>
 
+      <?php $left = (paise($pm['amount']) - paise($pm['approved_amount'])) / 100;
+      if (can('request') && $pm['status'] === 'approved' && $left > 0): ?>
+        <details class="panel" id="next"><summary>➕ Request next part <small>(<?= money($left) ?> not approved yet)</small></summary>
+          <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="next">
+            <?= pay_mode_html(number_format($left, 2, '.', '')) ?>
+            <?= approver_select(approvers_of('invoice', $id)) ?>
+            <label>Note <small>(optional)</small><input name="note" placeholder="e.g. second instalment as agreed"></label>
+            <button>📨 Send for approval</button></form>
+        </details>
+      <?php endif ?>
       <?php if ($editable): ?>
         <details class="panel"><summary>📅 Change due date / add follow-up</summary>
           <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="due">
@@ -455,8 +484,9 @@ case 'payment':
           <div class="grid">
             <label>Invoice amount (₹)<input name="amount" inputmode="decimal" value="<?= h($pm['amount'] ?? '') ?>" required></label>
             <label>Due date<input type="date" name="due_date" value="<?= h($pm['due_date'] ?? '') ?>" required></label>
-            <?= approver_select($pm ? approvers_of('invoice', $id) : []) ?>
           </div>
+          <?= $pm ? pay_mode_html(number_format((paise($pm['amount']) - paise($pm['paid'])) / 100, 2, '.', ''), $pm['request_amount']) : pay_mode_html(null) ?>
+          <?= approver_select($pm ? approvers_of('invoice', $id) : []) ?>
           <label>📎 Invoice copy <small>(photo or PDF — you can pick several; on a phone you can use the camera)</small>
             <input type="file" name="files[]" accept="image/*,.pdf" multiple></label>
           <?php if ($pm): ?><small>Saving changes sends this invoice back for approval.</small><?php endif ?>

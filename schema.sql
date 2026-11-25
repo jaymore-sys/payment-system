@@ -18,7 +18,7 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '9');
+INSERT INTO app_meta VALUES ('schema', '10');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -69,6 +69,8 @@ CREATE TABLE payments (
   products      TEXT NOT NULL,                   -- products / remarks
   bill_type     ENUM('gst','cash') NOT NULL,
   amount        DECIMAL(14,2) NOT NULL,          -- invoice amount
+  request_amount  DECIMAL(14,2),                -- amount asked for in the current approval round (full or a part)
+  approved_amount DECIMAL(14,2) NOT NULL DEFAULT 0, -- total approved to pay so far (payments can't go above it)
   due_date      DATE NOT NULL,
   status        ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
   approver_id   INT,                             -- first admin it was sent to (all of them: request_approvers)
@@ -206,6 +208,7 @@ CREATE OR REPLACE VIEW payment_register AS
   SELECT pm.*, p.name AS party,
          COALESCE(po.paid, 0) AS paid,
          pm.amount - COALESCE(po.paid, 0) AS outstanding,
+         GREATEST(0, pm.approved_amount - COALESCE(po.paid, 0)) AS payable,
          po.last_paid_on,
          CASE WHEN COALESCE(po.paid, 0) >= pm.amount THEN 'Paid'
               WHEN COALESCE(po.paid, 0) > 0 THEN 'Part Paid' ELSE 'Unpaid' END AS pay_status,
@@ -233,7 +236,8 @@ CREATE OR REPLACE VIEW requests AS
          pm.products AS item, pm.bill_type, pm.due_date, (SELECT COUNT(*) FROM attachments a WHERE a.payment_id = pm.id) AS files,
          (SELECT GROUP_CONCAT(CONCAT(u.name, ':', ra.decision) ORDER BY u.name SEPARATOR '|') FROM request_approvers ra JOIN users u ON u.id = ra.user_id
            WHERE ra.type = 'invoice' AND ra.request_id = pm.id) AS approvers,
-         pm.amount, pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
+         COALESCE(pm.request_amount, pm.amount) AS amount, pm.amount AS invoice_amount, pm.approved_amount,
+         pm.status, pm.approver_id, pm.reject_reason, pm.created_by, pm.created_at
     FROM payments pm JOIN parties p ON p.id = pm.party_id;
 
 CREATE OR REPLACE VIEW current_balance AS

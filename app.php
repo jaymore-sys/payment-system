@@ -157,6 +157,14 @@ const MIGRATIONS = [
         "UPDATE receivables SET status = 'approved' WHERE status = 'pending'",
         "DELETE FROM request_approvers WHERE type = 'receipt' AND decision = 'pending'",
     ],
+    10 => [ // part payments: each approval round approves an amount (full or a part)
+        "DROP VIEW IF EXISTS requests, upcoming_dues, current_balance, statement, payment_register",
+        "ALTER TABLE payments ADD COLUMN request_amount DECIMAL(14,2) AFTER amount, ADD COLUMN approved_amount DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER request_amount",
+        "UPDATE payments SET request_amount = amount",
+        // approved invoices could be paid in full; others keep what was already paid
+        "UPDATE payments pm SET approved_amount = IF(pm.status = 'approved', pm.amount,
+           LEAST(pm.amount, COALESCE((SELECT SUM(po.amount) FROM payouts po WHERE po.payment_id = pm.id), 0)))",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -407,6 +415,29 @@ function log_request(string $type, int $id, string $action, ?string $note = null
 {
     q('INSERT INTO request_log (type, request_id, user_id, action, note) VALUES (?, ?, ?, ?, ?)', [$type, $id, me()['id'], $action, $note]);
 }
+// "Full payment" / "Part payment" choice; the part amount box shows only when Part is picked (CSS)
+function pay_mode_html(?string $max, ?string $current = null): string
+{
+    $part = $current !== null && $max !== null && paise($current) < paise($max);
+    return '<fieldset class="paymode"><legend>💸 Payment to request' . ($max !== null ? ' <small>(up to ' . money($max) . ')</small>' : '') . '</legend>'
+        . '<label class="chip"><input type="radio" name="pay_mode" value="full"' . ($part ? '' : ' checked') . '> Full payment</label>'
+        . '<label class="chip"><input type="radio" name="pay_mode" value="part"' . ($part ? ' checked' : '') . '> Part payment</label>'
+        . '<label class="part-amt">Part amount (₹)<input name="part_amount" inputmode="decimal" value="' . ($part ? h($current) : '') . '" placeholder="e.g. 50000"></label>'
+        . '</fieldset>';
+}
+// amount asked for: everything still open ($max) or the part typed in
+function request_in(string $max): string
+{
+    if (paise($max) <= 0) fail('Nothing is left to request on this invoice.');
+    if (($_POST['pay_mode'] ?? 'full') !== 'part') return number_format(paise($max) / 100, 2, '.', '');
+    $amt = amount_in($_POST['part_amount'] ?? '');
+    if (paise($amt) > paise($max)) fail('The part amount is more than what is left to request (' . money($max) . ').');
+    return $amt;
+}
+function pay_text(string $req, string $total): string
+{
+    return paise($req) < paise($total) ? 'part payment ' . money($req) . ' of ' . money($total) : 'full payment ' . money($req);
+}
 function names_of(array $ids): string
 {
     return $ids ? implode(', ', q('SELECT name FROM users WHERE id IN (' . implode(',', array_fill(0, count($ids), '?')) . ') ORDER BY name', $ids)->fetchAll(PDO::FETCH_COLUMN)) : '';
@@ -422,7 +453,6 @@ function review(string $type, int $id, bool $approve, string $reason = ''): stri
     $r = q("SELECT status FROM $table WHERE id = ? FOR UPDATE", [$id])->fetch() ?: fail('Request not found', 404);
     if ($r['status'] !== 'pending') fail("This request is already {$r['status']}.");
     if (!can_decide($type, $id)) fail(in_array($uid, approvers_of($type, $id), true) ? 'You have already voted on this request.' : 'This request was sent to other admins.', 403);
-    if (!$approve && $type === 'invoice' && q('SELECT 1 FROM payouts WHERE payment_id = ?', [$id])->fetch()) fail('Payments were already made against this invoice, so it cannot be rejected.');
     q("INSERT INTO request_approvers (type, request_id, user_id, decision, reason, decided_at) VALUES (?, ?, ?, ?, ?, NOW())
        ON DUPLICATE KEY UPDATE decision = VALUES(decision), reason = VALUES(reason), decided_at = NOW()", [$type, $id, $uid, $approve ? 'approved' : 'rejected', $approve ? null : $reason]);
     log_request($type, $id, $approve ? 'approved' : 'rejected', $approve ? null : $reason);
@@ -438,7 +468,8 @@ function review(string $type, int $id, bool $approve, string $reason = ''): stri
         q("UPDATE $table SET status = 'rejected', reviewed_by = ?, reject_reason = ? WHERE id = ?",
           [$uid, implode('; ', array_map(fn($v) => "{$v['name']}: {$v['reason']}", $no)), $id]);
     } else {
-        q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL WHERE id = ?", [$uid, $id]);
+        q("UPDATE $table SET status = 'approved', reviewed_by = ?, reject_reason = NULL,
+           approved_amount = LEAST(amount, approved_amount + COALESCE(request_amount, amount)) WHERE id = ?", [$uid, $id]);
     }
     $n = count(approvers_of($type, $id));
     db()->commit();
@@ -523,7 +554,8 @@ function requests_list(array $rows, callable $date, bool $actions = true): void
           if (count($v) > 1 || $r['status'] !== 'pending') echo votes_html($v) ?>
         </div>
         <div class="req-side">
-          <div class="req-amt"><?= money($r['amount']) ?></div>
+          <div class="req-amt"><?= money($r['amount']) ?><?= isset($r['invoice_amount']) && paise($r['amount']) < paise($r['invoice_amount'])
+              ? '<small class="part-of">part of ' . money($r['invoice_amount']) . '</small>' : '' ?></div>
           <?php if (!$actions): // no buttons (e.g. on the send-again page itself)
                 elseif (can_decide($r['type'], (int) $r['id'])): echo review_buttons($r['type'], (int) $r['id'], $r['status']);
                 elseif ($r['status'] === 'rejected' && can('request')): ?>
@@ -587,13 +619,13 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=25">
+<link rel="stylesheet" href="style.css?v=26">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
 <input type="checkbox" id="nav-toggle" hidden>
 <aside class="side">
-  <a class="brand" href="?"><img src="vnl-logo.webp" alt="Valencia Nutrition"><small>Payment Desk</small></a>
+  <a class="brand" href="?"><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><small>Payment Desk</small></a>
   <nav>
   <?php foreach ($nav as [$p, $icon, $label, $perm]): if (!can($perm)) continue; ?>
     <a href="?p=<?= $p ?>" class="<?= $p === $cur ? 'active' : '' ?>"><span class="ico"><?= $icon ?></span><?= $label ?>
@@ -605,12 +637,12 @@ function head(string $title, string $actions = ''): void
   </div>
   <a class="logout" href="?p=logout">⏻ Logout</a>
 </aside>
-<header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><img src="vnl-logo.webp" alt="Valencia Nutrition"><strong>Payment Desk</strong>
+<header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><strong>Payment Desk</strong>
   <?php if ($count): ?><a class="count" href="?p=approvals"><?= $count ?></a><?php endif ?></header>
 <label for="nav-toggle" class="scrim"></label>
 <main class="content">
 <?php else: ?>
-<main class="auth-box"><div class="brand"><img src="vnl-logo.webp" alt="Valencia Nutrition"><small>Payment Desk</small></div>
+<main class="auth-box"><div class="brand"><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><small>Payment Desk</small></div>
 <?php endif ?>
 <?php if ($flash): ?><div class="flash">✅ <?= h($flash) ?></div><?php endif ?>
 <div class="page-head"><h1><?= h($title) ?></h1><?php if ($actions): ?><div class="actions"><?= $actions ?></div><?php endif ?></div>
@@ -655,6 +687,32 @@ document.querySelectorAll('select[data-addnew]').forEach(s => {
   const sync = () => { const on = s.value === '__new'; box.hidden = !on; box.required = on; if (on) box.focus(); };
   s.addEventListener('change', sync); sync();
 });
+// motion: count-up numbers, button ripple, spinner while saving, success message fades away
+const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (!calm) document.querySelectorAll('.stat .big').forEach(big => {
+  const el = big.querySelector('a') || big, m = el.textContent.trim().match(/^(-?)(₹?)([\d,]+)(\.\d\d)?$/);
+  if (!m) return;
+  const end = parseFloat(m[3].replace(/,/g, '') + (m[4] || '')), dec = m[4] ? 2 : 0, t0 = performance.now();
+  const show = v => el.textContent = m[1] + m[2] + v.toLocaleString('en-IN', {minimumFractionDigits: dec, maximumFractionDigits: dec});
+  const step = t => { const k = Math.min(1, (t - t0) / 900); show(end * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(step); };
+  show(0); requestAnimationFrame(step);
+});
+document.addEventListener('pointerdown', e => {
+  const b = !calm && e.target.closest('button, [role=button], a.pay-btn');
+  if (!b) return;
+  const r = b.getBoundingClientRect(), s = Math.max(r.width, r.height), dot = document.createElement('span');
+  dot.className = 'ripple'; dot.style.cssText = `width:${s}px;height:${s}px;left:${e.clientX - r.left - s / 2}px;top:${e.clientY - r.top - s / 2}px`;
+  b.append(dot); setTimeout(() => dot.remove(), 600);
+});
+document.addEventListener('submit', e => {
+  const f = e.target;
+  if (e.defaultPrevented || f.method !== 'post') return;
+  if (f.dataset.sent) return e.preventDefault(); // no double saves on a slow phone connection
+  f.dataset.sent = 1; (e.submitter || f.querySelector('button'))?.classList.add('busy');
+});
+addEventListener('pageshow', e => { if (e.persisted) document.querySelectorAll('form[data-sent]').forEach(f => {
+  delete f.dataset.sent; f.querySelectorAll('.busy').forEach(b => b.classList.remove('busy')); }); });
+document.querySelectorAll('.flash').forEach(f => setTimeout(() => f.classList.add('gone'), 4500));
 </script>
 </body></html>
 <?php

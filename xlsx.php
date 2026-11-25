@@ -164,9 +164,9 @@ function import_register(string $path, int $uid): array
         $k = import_key($r['party'], $no, $r['invoice_date'], $amount);
         if (($seen[$k] ?? 0) > 0) { $seen[$k]--; $skipped++; continue; }
         $product = $r['remarks'] !== '' ? product_name(mb_substr($r['remarks'], 0, 190)) : '';
-        q("INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, due_date, status, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?)",
-          [party_id(mb_substr($r['party'], 0, 190)), $no, $r['invoice_date'], $product, $no ? 'gst' : 'cash', $amount, $r['due_date'] ?? $r['invoice_date'], $uid]);
+        q("INSERT INTO payments (party_id, invoice_no, invoice_date, products, bill_type, amount, request_amount, approved_amount, due_date, status, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?)",
+          [party_id(mb_substr($r['party'], 0, 190)), $no, $r['invoice_date'], $product, $no ? 'gst' : 'cash', $amount, $amount, $amount, $r['due_date'] ?? $r['invoice_date'], $uid]);
         $pid = (int) db()->lastInsertId();
         if (paise($paid) > 0) {
             q("INSERT INTO payouts (payment_id, amount, paid_on, note, in_balance, created_by) VALUES (?, ?, ?, 'Paid before import (from Excel)', FALSE, ?)",
