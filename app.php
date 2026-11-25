@@ -200,6 +200,9 @@ const MIGRATIONS = [
         "DELETE FROM sales_people",
         'DELETE UPLOADED FILES', // invoice copies and photos on disk (handled in db())
     ],
+    14 => [ // deleted users: login switched off, name kept on old records
+        "ALTER TABLE users ADD COLUMN deleted_at DATETIME NULL",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -218,7 +221,7 @@ function upload_dir(): string
 function me(): ?array
 {
     static $u = false;
-    if ($u === false) $u = isset($_SESSION['uid']) ? (q('SELECT * FROM users WHERE id = ?', [$_SESSION['uid']])->fetch() ?: null) : null;
+    if ($u === false) $u = isset($_SESSION['uid']) ? (q('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [$_SESSION['uid']])->fetch() ?: null) : null;
     return $u;
 }
 const ROLES = ['administrator' => 'Administrator: makes requests', 'admin' => 'Admin: approves', 'superadmin' => 'Super admin: views everything',
@@ -427,7 +430,7 @@ function inbox_card(array $r, string $extra = ''): string
 // "Send request to": one or more admins, ticked. ALL of them must approve; one reject rejects.
 function approver_select(array $current = []): string
 {
-    $admins = q("SELECT id, name FROM users WHERE role = 'admin' ORDER BY name")->fetchAll();
+    $admins = q("SELECT id, name FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY name")->fetchAll();
     if (!$admins) return '<p class="neg">No Admin login exists yet. Ask the Developer to create one.</p>';
     if (!$current && count($admins) === 1) $current = [(int) $admins[0]['id']];
     $o = '';
@@ -440,7 +443,7 @@ function approver_in(): array
 {
     $ids = array_values(array_unique(array_map('intval', (array) ($_POST['approvers'] ?? []))));
     if (!$ids) fail('Tick at least one admin to send the request to');
-    $ok = q('SELECT id FROM users WHERE role = \'admin\' AND id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')', $ids)->fetchAll(PDO::FETCH_COLUMN);
+    $ok = q('SELECT id FROM users WHERE role = \'admin\' AND deleted_at IS NULL AND id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')', $ids)->fetchAll(PDO::FETCH_COLUMN);
     if (count($ok) !== count($ids)) fail('One of the chosen people is not an admin');
     return $ids;
 }

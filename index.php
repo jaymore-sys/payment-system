@@ -47,7 +47,7 @@ case 'setup':
 case 'login':
     $err = '';
     if ($post) {
-        $u = q('SELECT * FROM users WHERE email = ?', [trim($_POST['email'] ?? '')])->fetch();
+        $u = q('SELECT * FROM users WHERE email = ? AND deleted_at IS NULL', [trim($_POST['email'] ?? '')])->fetch();
         if ($u && password_verify($_POST['password'] ?? '', $u['password_hash'])) { login($u['id']); go('?'); }
         $err = 'Wrong email or password';
     }
@@ -840,6 +840,17 @@ case 'users':
         } elseif ($a === 'role') {
             if ($id === (int) me()['id']) fail('You cannot change your own role');
             q('UPDATE users SET role = ? WHERE id = ?', [enum_in($_POST['role'] ?? '', array_keys(ROLES)), $id]);
+        } elseif ($a === 'delete') {
+            if ($id === (int) me()['id']) fail('You cannot delete your own login');
+            $who = q('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [$id])->fetch() ?: fail('User not found', 404);
+            $waiting = (int) q("SELECT COUNT(*) FROM request_approvers WHERE user_id = ? AND decision = 'pending'", [$id])->fetchColumn();
+            if ($waiting) fail("{$who['name']} still has $waiting request(s) waiting for their vote. They must vote first, or the request must be rejected and sent again to other admins.");
+            try { // no history: remove completely
+                q('DELETE FROM users WHERE id = ?', [$id]);
+            } catch (PDOException) { // has invoices, votes, chat…: switch the login off, keep the name on old records
+                q("UPDATE users SET deleted_at = NOW(), password_hash = '!', email = LEFT(CONCAT('deleted-', id, '-', email), 190) WHERE id = ?", [$id]);
+            }
+            go('?p=users', $who['name'] . ' deleted');
         } elseif ($a === 'password') {
             if (strlen($_POST['password'] ?? '') < 8) fail('Password must be at least 8 characters');
             q('UPDATE users SET password_hash = ? WHERE id = ?', [password_hash($_POST['password'], PASSWORD_DEFAULT), $id]);
@@ -858,8 +869,8 @@ case 'users':
         <button>Add user</button></form>
     </details>
     <?php endif ?>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><?= $edit ? '<th>Reset password</th>' : '' ?></tr></thead><tbody>
-    <?php foreach (q('SELECT * FROM users ORDER BY name')->fetchAll() as $u): ?>
+    <div class="tbl"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><?= $edit ? '<th>Reset password</th><th></th>' : '' ?></tr></thead><tbody>
+    <?php foreach (q('SELECT * FROM users WHERE deleted_at IS NULL ORDER BY name')->fetchAll() as $u): ?>
       <tr><td><strong><?= h($u['name']) ?></strong></td><td><?= h($u['email']) ?></td>
         <td><?php if (!$edit || $u['id'] == me()['id']): ?><?= h(ROLES[$u['role']]) ?><?= $u['id'] == me()['id'] ? ' (you)' : '' ?><?php else: ?>
           <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="role"><input type="hidden" name="id" value="<?= $u['id'] ?>"><?= $role_select($u['role']) ?></form>
@@ -867,9 +878,11 @@ case 'users':
         <?php if ($edit): ?>
         <td><form method="post" class="inline"><?= csrf_field() ?><input type="hidden" name="a" value="password"><input type="hidden" name="id" value="<?= $u['id'] ?>">
           <input name="password" type="password" placeholder="New password" minlength="8" required><button class="secondary">Set</button></form></td>
+        <td><?php if ($u['id'] != me()['id']): ?><form method="post" onsubmit="return confirm('Delete <?= h(addslashes($u['name'])) ?>? They will not be able to log in any more.')"><?= csrf_field() ?>
+          <input type="hidden" name="a" value="delete"><input type="hidden" name="id" value="<?= $u['id'] ?>"><button class="no">🗑 Delete</button></form><?php endif ?></td>
         <?php endif ?></tr>
     <?php endforeach ?></tbody></table></div>
-    <?php if ($edit): ?><p><small>To remove someone's access, set a new password they don't know.</small></p><?php endif;
+    <?php if ($edit): ?><p><small>Deleting someone stops their login at once. Their name stays on invoices, votes and chat they were part of.</small></p><?php endif;
     foot();
 
 default:
