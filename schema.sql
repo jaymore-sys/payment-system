@@ -18,14 +18,14 @@ CREATE TABLE app_meta (
   k VARCHAR(30) PRIMARY KEY,
   v VARCHAR(100) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT INTO app_meta VALUES ('schema', '10');
+INSERT INTO app_meta VALUES ('schema', '11');
 
 CREATE TABLE users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
   name          VARCHAR(100) NOT NULL,
   email         VARCHAR(190) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,           -- PHP password_hash()
-  role          ENUM('superadmin','admin','administrator','developer') NOT NULL DEFAULT 'administrator',
+  role          ENUM('superadmin','admin','administrator','developer','user') NOT NULL DEFAULT 'administrator',
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -173,6 +173,24 @@ CREATE TABLE attachments (
   created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (payment_id)  REFERENCES payments(id) ON DELETE CASCADE,
   FOREIGN KEY (uploaded_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- invoice photos sent in by 'user' logins; the Administrator turns each into an invoice or closes it
+CREATE TABLE inbox (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  file_path   VARCHAR(255) NOT NULL,
+  file_name   VARCHAR(255) NOT NULL,
+  note        VARCHAR(500) NOT NULL DEFAULT '',
+  uploaded_by INT NOT NULL,
+  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  payment_id  INT NULL,                      -- invoice made from it
+  closed_by   INT NULL,
+  closed_at   DATETIME NULL,
+  close_note  VARCHAR(500) NULL,             -- why it was closed without an invoice
+  FOREIGN KEY (uploaded_by) REFERENCES users(id),
+  FOREIGN KEY (payment_id)  REFERENCES payments(id) ON DELETE SET NULL,
+  FOREIGN KEY (closed_by)   REFERENCES users(id),
+  INDEX (closed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- who an invoice / receipt request was sent to, and each admin's vote; everyone votes, all yes = approved, any no = rejected

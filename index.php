@@ -16,7 +16,7 @@ if ($post && !hash_equals(csrf(), $_POST['csrf'] ?? '')) fail('Your session expi
 // developer only manages logins: send them to Users instead of the money pages
 if (me() && !can('view') && in_array($p, ['home', 'approvals', 'payments', 'outstanding', 'payment', 'file', 'msgs', 'chat', 'receivables', 'statement'], true)) {
     if ($p === 'msgs') { http_response_code(403); exit; }
-    go('?p=users');
+    go(can('upload') ? '?p=uploads' : '?p=users'); // 'user' logins only send invoice photos
 }
 $date = fn(?string $d) => $d ? h(date('d M Y', strtotime($d))) : '';
 $sel  = fn(string $k, string $v) => ($_GET[$k] ?? '') === $v ? 'selected' : '';
@@ -124,7 +124,10 @@ case 'home':
         $open_req = can('request') ? (int) q("SELECT COUNT(*) FROM requests WHERE created_by = ? AND status = 'pending'", [me()['id']])->fetchColumn()
                                    : (int) q("SELECT COUNT(*) FROM requests WHERE status = 'pending'")->fetchColumn();
         $acts = can('request') ? '<a href="?p=payment" role="button">＋ New invoice</a><a href="?p=receivables#add" role="button" class="secondary">＋ Receipt</a>' : '';
-        head('Dashboard', $acts); ?>
+        head('Dashboard', $acts);
+        if (can('inbox') && ($n = (int) q('SELECT COUNT(*) FROM inbox WHERE closed_at IS NULL')->fetchColumn())): ?>
+          <a class="alert-link" href="?p=inbox">📨 <strong><?= $n ?> new invoice photo<?= $n > 1 ? 's' : '' ?></strong> sent in — make the invoice<?= $n > 1 ? 's' : '' ?> →</a>
+        <?php endif ?>
         <div class="stats">
           <article class="stat" data-icon="🏦"><small>Current balance</small><div class="big <?= $bal < 0 ? 'neg' : '' ?>"><?= money($bal) ?></div></article>
           <article class="stat" data-icon="📌"><small>Total outstanding</small><div class="big"><a href="?p=outstanding"><?= money($t['outstanding']) ?></a></div></article>
@@ -295,6 +298,9 @@ case 'payment':
     $pm = $id ? (q("SELECT r.*, u.name AS creator, v.name AS reviewer, (SELECT approvers FROM requests WHERE type = 'invoice' AND id = r.id) AS approvers
                     FROM payment_register r JOIN users u ON u.id = r.created_by LEFT JOIN users v ON v.id = r.reviewed_by WHERE r.id = ?", [$id])->fetch() ?: fail('Invoice not found', 404)) : null;
     if (!$pm) need('request');
+    $from = $pm ? null : (int) ($_GET['from'] ?? 0); // new invoice typed from an invoice photo in the inbox
+    $inb = $from ? (q('SELECT i.*, u.name AS by_name FROM inbox i JOIN users u ON u.id = i.uploaded_by WHERE i.id = ? AND i.closed_at IS NULL', [$from])->fetch()
+                    ?: fail('That invoice photo was already handled.')) : null;
     // administrator can edit until fully paid; any edit goes back for approval
     $editable = can('request') && (!$pm || $pm['outstanding'] > 0);
     $uid = me()['id'];
@@ -339,6 +345,12 @@ case 'payment':
                    request_amount = ?, approved_amount = ?, status = 'pending', reviewed_by = NULL, reject_reason = NULL WHERE id = ?", [...$f, $req, $pm['paid'], $id]);
             }
             save_uploads($id, $files);
+            if ($inb) { // the photo becomes the invoice copy (a copy, so the sender still sees what they sent)
+                $copy = bin2hex(random_bytes(16)) . '.' . strtolower(pathinfo($inb['file_path'], PATHINFO_EXTENSION));
+                if (copy(upload_dir() . '/' . basename($inb['file_path']), upload_dir() . "/$copy"))
+                    q('INSERT INTO attachments (payment_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)', [$id, $copy, $inb['file_name'], $inb['uploaded_by']]);
+                q('UPDATE inbox SET payment_id = ?, closed_by = ?, closed_at = NOW() WHERE id = ?', [$id, $uid, $inb['id']]);
+            }
             send_request('invoice', $id, $approvers, (bool) $pm, pay_text($req, $amount) . ($pm ? ' — invoice details were edited' : ''));
             go("?p=payment&id=$id", 'Saved and sent for approval');
         case 'pay': // record a full or part payment
@@ -472,6 +484,9 @@ case 'payment':
       <?php endif ?>
     <?php endif;
 
+    if ($inb): ?>
+      <div class="from-photo"><?= inbox_card($inb, '<small>Type the details from this photo. It is attached to the invoice when you save.</small>') ?></div>
+    <?php endif;
     if ($editable): ?>
       <details class="panel" <?= $pm ? '' : 'open' ?>><summary><?= $pm ? '✏️ Edit details' : '🧾 Invoice details' ?></summary>
         <form method="post" enctype="multipart/form-data"><?= csrf_field() ?><input type="hidden" name="a" value="save">
@@ -527,13 +542,68 @@ case 'payment':
 
 case 'file':
     $f = q('SELECT * FROM attachments WHERE id = ?', [(int) ($_GET['id'] ?? 0)])->fetch() ?: fail('File not found', 404);
-    $path = upload_dir() . '/' . basename($f['file_path']);
-    if (!is_file($path)) fail('File missing on server', 404);
-    header('Content-Type: ' . FILE_TYPES[pathinfo($path, PATHINFO_EXTENSION)]);
-    header("Content-Disposition: inline; filename*=UTF-8''" . rawurlencode($f['file_name']));
-    header('X-Content-Type-Options: nosniff');
-    readfile($path);
-    exit;
+    send_file($f['file_path'], $f['file_name']);
+
+// ── invoice photos: 'user' logins send them, the Administrator turns them into invoices ──
+case 'inboxfile':
+    $f = q('SELECT * FROM inbox WHERE id = ?', [(int) ($_GET['id'] ?? 0)])->fetch() ?: fail('File not found', 404);
+    if (!can('inbox') && (int) $f['uploaded_by'] !== (int) me()['id']) fail('Your role does not allow this.', 403);
+    send_file($f['file_path'], $f['file_name']);
+
+case 'uploads':
+    need('upload');
+    if ($post) {
+        $files = checked_uploads('files') ?: fail('Choose at least one photo or PDF of the invoice.');
+        $note = mb_substr(trim($_POST['note'] ?? ''), 0, 500);
+        foreach ($files as $f)
+            q('INSERT INTO inbox (file_path, file_name, note, uploaded_by) VALUES (?, ?, ?, ?)', [store_upload($f), mb_substr($f['name'], 0, 255), $note, me()['id']]);
+        go('?p=uploads', count($files) . ' file' . (count($files) > 1 ? 's' : '') . ' sent to the Administrator');
+    }
+    $rows = q('SELECT * FROM inbox WHERE uploaded_by = ? ORDER BY id DESC LIMIT 100', [me()['id']])->fetchAll();
+    head('Send invoice photo'); ?>
+    <form method="post" enctype="multipart/form-data" class="panel upload-box"><?= csrf_field() ?>
+      <label class="drop">📷 <strong>Take or choose invoice photos</strong><small>Photo or PDF · you can pick several</small>
+        <input type="file" name="files[]" accept="image/*,.pdf" multiple required></label>
+      <label>Note for the Administrator <small>(optional)</small><input name="note" maxlength="500" placeholder="e.g. Diesel bill, pay by Friday"></label>
+      <button>📨 Send to Administrator</button>
+    </form>
+    <h3>What you have sent</h3>
+    <?php if (!$rows): ?><p class="note">Nothing sent yet.</p><?php endif ?>
+    <div class="photos">
+    <?php foreach ($rows as $r)
+        echo inbox_card($r, $r['payment_id'] ? '<span class="badge approved">✅ Invoice entered</span>'
+            : ($r['closed_at'] ? '<span class="badge rejected">Closed</span>' . ($r['close_note'] ? '<div class="why">' . h($r['close_note']) . '</div>' : '')
+            : '<span class="badge pending">⏳ With the Administrator</span>')); ?>
+    </div>
+    <?php foot();
+
+case 'inbox':
+    need('inbox');
+    if ($post) { // closed without an invoice (duplicate, not a bill, …)
+        $n = q("UPDATE inbox SET closed_by = ?, closed_at = NOW(), close_note = ? WHERE id = ? AND closed_at IS NULL",
+               [me()['id'], mb_substr(req('reason'), 0, 500), (int) ($_POST['id'] ?? 0)])->rowCount();
+        go('?p=inbox', $n ? 'Closed' : 'Already handled');
+    }
+    $q = 'SELECT i.*, u.name AS by_name, pm.invoice_no FROM inbox i JOIN users u ON u.id = i.uploaded_by LEFT JOIN payments pm ON pm.id = i.payment_id';
+    $open = q("$q WHERE i.closed_at IS NULL ORDER BY i.id")->fetchAll();
+    $done = q("$q WHERE i.closed_at IS NOT NULL ORDER BY i.closed_at DESC LIMIT 30")->fetchAll();
+    head('Invoice inbox'); ?>
+    <?php if (!$open): ?><p class="note">🎉 No new invoice photos.</p><?php endif ?>
+    <div class="photos">
+    <?php foreach ($open as $r)
+        echo inbox_card($r, '<div class="photo-acts"><a role="button" href="?p=payment&from=' . $r['id'] . '">🧾 Make invoice</a>'
+            . '<button type="button" class="secondary" data-reject>✕ Close</button><form method="post" class="inline rej-form" hidden>' . csrf_field()
+            . '<input type="hidden" name="id" value="' . $r['id'] . '"><input name="reason" placeholder="Why? e.g. duplicate" required><button class="no">Close</button></form></div>'); ?>
+    </div>
+    <?php if ($done): ?>
+    <h3>Handled recently</h3>
+    <div class="photos">
+    <?php foreach ($done as $r)
+        echo inbox_card($r, $r['payment_id'] ? '<a class="badge approved" href="?p=payment&id=' . $r['payment_id'] . '">✅ Invoice ' . h($r['invoice_no'] ?: '#' . $r['payment_id']) . '</a>'
+            : '<span class="badge rejected">Closed</span>' . ($r['close_note'] ? '<div class="why">' . h($r['close_note']) . '</div>' : '')); ?>
+    </div>
+    <?php endif;
+    foot();
 
 // ── chat ──────────────────────────────────────────────────────────────────
 case 'msgs': // polled by the chat box

@@ -207,7 +207,6 @@ dialog article { max-width: 760px; }
   .req .review .rej-form { grid-column: 1 / -1; }
   .req .review .rej-form button { width: auto; }
 }
-}
 
 /* ── "send request to" admin chips ─────────────────────────── */
 fieldset.approvers { margin: 0 0 1rem; padding: .6rem .9rem .5rem; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
@@ -344,3 +343,47 @@ body.auth::after { bottom: -30vmax; right: -20vmax; background: radial-gradient(
   *, *::before, *::after { animation: none !important; transition: none !important; }
   @view-transition { navigation: none; }
 }
+
+/* ── compact approval tiles: two or three per row on wide screens ── */
+button, [role=button] { white-space: nowrap; }
+@media (min-width: 701px) {
+  .reqs { grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); align-items: start; }
+  .req { grid-template-columns: minmax(0, 1fr); gap: .6rem; padding: .85rem 1rem; }
+  .req-title { font-size: 1rem; }
+  .req-line { font-size: .92rem; }
+  .req-meta { margin-top: .35rem; font-size: .78rem; }
+  .req .votes { margin-top: .5rem; padding: .45rem .6rem; }
+  .req .votes li { font-size: .84rem; }
+  .req-side { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem;
+    border-top: 1px dashed var(--line); padding-top: .6rem; }
+  .req-amt { font-size: 1.2rem; }
+  .req .review form.inline button, .req .review > button.no, .req a.resend { height: 2.3rem; padding: 0 .9rem; font-size: .86rem; }
+}
+
+/* ── invoice photos (User → Administrator) ── */
+.photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: .9rem; margin-bottom: 1rem; }
+.photo { margin: 0; padding: 0; overflow: hidden; display: flex; flex-direction: column; animation: rise .45s cubic-bezier(.2, .7, .2, 1) backwards; }
+.photo .thumb { display: grid; place-items: center; height: 190px; background: #f1f5f9; text-decoration: none; color: var(--muted); font-weight: 700; text-align: center; overflow: hidden; }
+.photo .thumb span { font-size: .85rem; padding: 1rem; overflow-wrap: anywhere; } .photo .thumb span::first-line { font-size: 2rem; }
+.photo .thumb img { width: 100%; height: 100%; object-fit: cover; transition: transform .35s ease; }
+@media (hover: hover) { .photo .thumb:hover img { transform: scale(1.05); } }
+.photo-body { display: grid; gap: .5rem; padding: .7rem .9rem .9rem; }
+.photo-body .req-meta { margin: 0; }
+.photo-body .badge { justify-self: start; }
+.photo-note { font-weight: 600; color: #344054; overflow-wrap: anywhere; }
+.photo-acts { display: flex; flex-wrap: wrap; gap: .5rem; }
+.photo-acts > [role=button], .photo-acts > button { margin: 0; padding: .5rem .9rem; font-size: .9rem; }
+.photo-acts .rej-form { flex-basis: 100%; display: flex; gap: .4rem; margin: 0; }
+.photo-acts .rej-form[hidden] { display: none; }
+.photo-acts .rej-form input { margin: 0; min-width: 0; } .photo-acts .rej-form button { margin: 0; width: auto; }
+.from-photo { max-width: 420px; margin-bottom: 1rem; } .from-photo .thumb { height: 260px; } .from-photo .thumb img { object-fit: contain; }
+.upload-box { max-width: 560px; }
+label.drop { display: grid; justify-items: center; gap: .25rem; padding: 1.6rem 1rem; margin-bottom: 1rem; border: 2px dashed var(--brand-line);
+  border-radius: 16px; background: var(--brand-soft); text-align: center; cursor: pointer; font-size: 1.6rem; transition: border-color .2s, background .2s; }
+label.drop strong { font-size: 1rem; } label.drop small { font-size: .8rem; }
+label.drop:hover, label.drop:focus-within { border-color: var(--brand); background: #ffe7df; }
+label.drop input { margin: .6rem 0 0; font-size: .85rem; max-width: 100%; }
+a.alert-link { display: block; margin-bottom: 1rem; padding: .8rem 1rem; border-radius: 12px; background: #e0f2fe; color: #075985;
+  border: 1px solid #bae6fd; text-decoration: none; font-weight: 600; animation: toast .4s ease backwards; }
+a.alert-link:hover { background: #bae6fd; }
+.photo-body .badge { text-transform: none; }

@@ -165,6 +165,14 @@ const MIGRATIONS = [
         "UPDATE payments pm SET approved_amount = IF(pm.status = 'approved', pm.amount,
            LEAST(pm.amount, COALESCE((SELECT SUM(po.amount) FROM payouts po WHERE po.payment_id = pm.id), 0)))",
     ],
+    11 => [ // 'user' logins send invoice photos to the Administrator
+        "ALTER TABLE users MODIFY role ENUM('superadmin','admin','administrator','developer','user') NOT NULL DEFAULT 'administrator'",
+        "CREATE TABLE IF NOT EXISTS inbox (id INT AUTO_INCREMENT PRIMARY KEY, file_path VARCHAR(255) NOT NULL, file_name VARCHAR(255) NOT NULL,
+           note VARCHAR(500) NOT NULL DEFAULT '', uploaded_by INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           payment_id INT NULL, closed_by INT NULL, closed_at DATETIME NULL, close_note VARCHAR(500) NULL,
+           FOREIGN KEY (uploaded_by) REFERENCES users(id), FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE SET NULL,
+           FOREIGN KEY (closed_by) REFERENCES users(id), INDEX (closed_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    ],
 ];
 
 function q(string $sql, array $args = []): PDOStatement
@@ -187,7 +195,7 @@ function me(): ?array
     return $u;
 }
 const ROLES = ['administrator' => 'Administrator: makes requests', 'admin' => 'Admin: approves', 'superadmin' => 'Super admin: views everything',
-               'developer' => 'Developer: manages logins'];
+               'developer' => 'Developer: manages logins', 'user' => 'User: only sends invoice photos'];
 // who may do what; every permission check in the app goes through can()/need()
 const PERMS = [
     'view'       => ['superadmin', 'admin', 'administrator'], // invoices, receipts, party outstanding, files
@@ -203,6 +211,8 @@ const PERMS = [
     'import'     => ['administrator'],
     'users'      => ['developer'],
     'see_users'  => ['superadmin', 'developer'],
+    'upload'     => ['user'],                                 // send invoice photos to the Administrator, see own uploads
+    'inbox'      => ['administrator'],                        // turn those photos into invoices
 ];
 function can(string $perm): bool { return in_array(me()['role'] ?? '', PERMS[$perm], true); }
 function need(string $perm): void { if (!can($perm)) fail('Your role does not allow this.', 403); }
@@ -353,14 +363,38 @@ function checked_uploads(string $field): array
     }
     return $out;
 }
+function store_upload(array $f): string // keeps the file outside public_html under a random name
+{
+    if (!is_dir(upload_dir())) mkdir(upload_dir(), 0750, true);
+    $stored = bin2hex(random_bytes(16)) . '.' . $f['ext'];
+    if (!move_uploaded_file($f['tmp'], upload_dir() . "/$stored")) fail('Could not save ' . $f['name']);
+    return $stored;
+}
 function save_uploads(int $payment_id, array $files): void
 {
-    if ($files && !is_dir(upload_dir())) mkdir(upload_dir(), 0750, true);
-    foreach ($files as $f) {
-        $stored = bin2hex(random_bytes(16)) . '.' . $f['ext'];
-        if (!move_uploaded_file($f['tmp'], upload_dir() . "/$stored")) fail('Could not save ' . $f['name']);
-        q('INSERT INTO attachments (payment_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)', [$payment_id, $stored, mb_substr($f['name'], 0, 255), me()['id']]);
-    }
+    foreach ($files as $f)
+        q('INSERT INTO attachments (payment_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)', [$payment_id, store_upload($f), mb_substr($f['name'], 0, 255), me()['id']]);
+}
+function send_file(string $stored, string $name): never
+{
+    $path = upload_dir() . '/' . basename($stored);
+    if (!is_file($path)) fail('File missing on server', 404);
+    header('Content-Type: ' . FILE_TYPES[pathinfo($path, PATHINFO_EXTENSION)]);
+    header("Content-Disposition: inline; filename*=UTF-8''" . rawurlencode($name));
+    header('X-Content-Type-Options: nosniff');
+    readfile($path);
+    exit;
+}
+function is_image(string $file): bool { return in_array(strtolower(pathinfo($file, PATHINFO_EXTENSION)), ['jpg', 'jpeg', 'png', 'webp'], true); }
+// one invoice photo: picture (or file icon) + who sent it + note
+function inbox_card(array $r, string $extra = ''): string
+{
+    $src = '?p=inboxfile&id=' . (int) $r['id'];
+    return '<article class="photo"><a class="thumb" href="' . $src . '" target="_blank">'
+        . (is_image($r['file_name']) ? '<img src="' . $src . '" alt="" loading="lazy">' : '<span>📄<br>' . h($r['file_name']) . '</span>') . '</a>'
+        . '<div class="photo-body"><div class="req-meta">' . (isset($r['by_name']) ? '<span>👤 ' . h($r['by_name']) . '</span>' : '')
+        . '<span>🕒 ' . h(date('d M Y, H:i', strtotime($r['created_at']))) . '</span></div>'
+        . ($r['note'] !== '' ? '<div class="photo-note">' . h($r['note']) . '</div>' : '') . $extra . '</div></article>';
 }
 
 // "Send request to": one or more admins, ticked. ALL of them must approve; one reject rejects.
@@ -607,8 +641,10 @@ function head(string $title, string $actions = ''): void
     $nav = [['home', '📊', 'Dashboard', 'view'], ['approvals', '✅', 'Approvals', 'view'], ['payments', '🧾', 'Invoices', 'view'],
             ['outstanding', '📌', 'Party outstanding', 'view'], ['receivables', '💰', 'Receipts', 'view'], ['cash', '🏦', 'Balance', 'see_cash'],
             ['statement', '📒', 'Statement', 'statement'], ['chat', '💬', 'Team chat', 'chat'], ['import', '📥', 'Import Excel', 'import'],
-            ['users', '👥', 'Users', 'see_users']];
-    $count = $u ? pending_for_me() : 0; ?>
+            ['users', '👥', 'Users', 'see_users'], ['inbox', '📨', 'Invoice inbox', 'inbox'], ['uploads', '📤', 'Send invoice photo', 'upload']];
+    // red badges: votes waiting (admins), invoice photos not handled yet (Administrator)
+    $badges = $u ? ['approvals' => pending_for_me(), 'inbox' => can('inbox') ? (int) q('SELECT COUNT(*) FROM inbox WHERE closed_at IS NULL')->fetchColumn() : 0] : [];
+    $count = max($badges ?: [0]); $count_to = array_search($count, $badges ?: [0]); ?>
 <!doctype html>
 <html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?= h($title) ?> · Valencia Payment Desk</title>
@@ -619,7 +655,7 @@ function head(string $title, string $actions = ''): void
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="pico.min.css">
-<link rel="stylesheet" href="style.css?v=26">
+<link rel="stylesheet" href="style.css?v=27">
 </head>
 <body class="<?= $u ? 'app' : 'auth' ?>">
 <?php if ($u): ?>
@@ -629,7 +665,7 @@ function head(string $title, string $actions = ''): void
   <nav>
   <?php foreach ($nav as [$p, $icon, $label, $perm]): if (!can($perm)) continue; ?>
     <a href="?p=<?= $p ?>" class="<?= $p === $cur ? 'active' : '' ?>"><span class="ico"><?= $icon ?></span><?= $label ?>
-      <?php if ($p === 'approvals' && $count): ?><b class="count"><?= $count ?></b><?php endif ?></a>
+      <?php if (!empty($badges[$p])): ?><b class="count"><?= $badges[$p] ?></b><?php endif ?></a>
   <?php endforeach ?>
   </nav>
   <div class="me"><span class="avatar"><?= h(mb_strtoupper(mb_substr($u['name'], 0, 1))) ?></span>
@@ -638,7 +674,7 @@ function head(string $title, string $actions = ''): void
   <a class="logout" href="?p=logout">⏻ Logout</a>
 </aside>
 <header class="topbar"><label for="nav-toggle" class="burger" aria-label="Menu">☰</label><img src="logo.webp" alt="Valencia Beverages &amp; Superwater"><strong>Payment Desk</strong>
-  <?php if ($count): ?><a class="count" href="?p=approvals"><?= $count ?></a><?php endif ?></header>
+  <?php if ($count): ?><a class="count" href="?p=<?= $count_to ?>"><?= $count ?></a><?php endif ?></header>
 <label for="nav-toggle" class="scrim"></label>
 <main class="content">
 <?php else: ?>
@@ -678,7 +714,8 @@ document.querySelectorAll('.tbl table').forEach(t => {
 // Reject: show the reason box (button turns into Cancel)
 document.querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', () => {
   const form = btn.nextElementSibling, open = form.hidden;
-  form.hidden = !open; btn.textContent = open ? 'Cancel' : '✕ Reject';
+  btn.dataset.label ??= btn.textContent;
+  form.hidden = !open; btn.textContent = open ? 'Cancel' : btn.dataset.label;
   if (open) form.querySelector('input[name=reason]').focus();
 }));
 // "Add new…" in party/product dropdowns shows a text box
